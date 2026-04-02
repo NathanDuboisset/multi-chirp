@@ -1,0 +1,23 @@
+[package]
+name = "tiny-chirp-microflow"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ariel-os = { path = "build/imports/ariel-os/src/ariel-os", features = ["time"] }
+ariel-os-boards = { path = "build/imports/ariel-os/src/ariel-os-boards" }
+microflow = { version = "0.1.3", default-features = false }
+microfft = { version = "0.6", default-features = false, features = ["size-1024"] }
+libm = { version = "0.2", default-features = false }
+nalgebra = { version = "0.32", default-features = false }
+
+[features]
+default = ["cnn_mel", "tf"]
+cnn_mel = []
+cnn_time = []
+tf = []
+torch = []
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+  'cfg(context, values(any()))',
+] }

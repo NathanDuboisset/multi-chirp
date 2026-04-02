@@ -1,0 +1,16 @@
+/target
+/build
+.gdb_history
+**/*.egg-info/
+.ipynb_checkpoints/
+
+.venv/
+models/*.onnx
+models/*.mlir
+src/audio_sample.rs
+/target
+/build
+.gdb_history
+*_savedmodel/
+*_saved_model/
+**/__pycache__/*

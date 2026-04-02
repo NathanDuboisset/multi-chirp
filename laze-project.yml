@@ -1,0 +1,14 @@
+imports:
+  - git:
+      url: https://github.com/ariel-os/ariel-os
+      tag: v0.4.0
+    dldir: ariel-os
+
+apps:
+  - name: tiny-chirp-microflow
+    selects:
+      - alloc
+    env:
+      global:
+        executor_stacksize_required:
+          - "256000"

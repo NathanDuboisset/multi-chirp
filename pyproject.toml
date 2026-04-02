@@ -1,0 +1,29 @@
+[project]
+name = "tiny-chirp-microflow-building"
+version = "0.1.0"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "tensorflow>=2.10",
+  "numpy",
+  "librosa",
+  "soundfile",
+  "ipykernel",
+  "jupyter",
+  "tensorflow-io[tensorflow]>=0.37.1",
+  "keras>=3.13.2",
+  "matplotlib>=3.10.8",
+  "tqdm>=4.67.3",
+  "requests>=2.32",
+  "birdnetlib>=0.9",
+  "python-dotenv>=1.0",
+  "pydantic>=2.0",
+  "scikit-learn>=1.4",
+  "pandas>=2.0",
+]
+
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
