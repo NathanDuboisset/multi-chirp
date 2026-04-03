@@ -25,6 +25,8 @@ ROOT = pyrootutils.setup_root(
 load_dotenv()
 
 RAW_DATASET_DIR = ROOT / "raw_dataset"
+# XC downloads: raw_dataset/species/<Genus_species>/*.mp3
+SPECIES_DIR = RAW_DATASET_DIR / "species"
 XC_API_BASE = "https://xeno-canto.org/api/3/recordings"
 ACCEPTED_QUALITY = {"A", "B"}
 
@@ -37,7 +39,7 @@ def download_species(
     scientific_name: str,
     max_recordings: int = 100,
     quality: set[str] = ACCEPTED_QUALITY,
-    dest_dir: Path = RAW_DATASET_DIR,
+    dest_dir: Path = SPECIES_DIR,
     api_key: str | None = None,
 ) -> list[Path]:
     """Download up to `max_recordings` MP3s for `scientific_name` from XC.
@@ -113,7 +115,7 @@ def download_species(
 def download_species_list(
     species_names: list[str],
     max_recordings: int = 100,
-    dest_dir: Path = RAW_DATASET_DIR,
+    dest_dir: Path = SPECIES_DIR,
 ) -> dict[str, list[Path]]:
     results: dict[str, list[Path]] = {}
     for name in tqdm(species_names, desc="Downloading species"):

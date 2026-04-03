@@ -21,6 +21,7 @@ dependencies = [
   "pandas>=2.0",
   "pyrootutils>=1.0",
   "types-tensorflow>=2.18.0.20260402",
+  "resampy>=0.4.3",
 ]
 
 [build-system]
