@@ -22,11 +22,19 @@ import librosa
 import numpy as np
 import soundfile as sf
 from birdnetlib import Recording
-from birdnetlib.analyzer import ModelAnalyzer
+from birdnetlib.analyzer import Analyzer as ModelAnalyzer
+import pyrootutils
 from tqdm import tqdm
 
-RAW_DATASET_DIR = Path(__file__).parent.parent / "raw_dataset"
-DATASETS_DIR = Path(__file__).parent.parent / "datasets"
+ROOT = pyrootutils.setup_root(
+    search_from=__file__,
+    indicator="pyproject.toml",
+    pythonpath=True,
+    dotenv=True,
+)
+
+RAW_DATASET_DIR = ROOT / "raw_dataset"
+DATASETS_DIR = ROOT / "datasets"
 
 BIRDNET_THRESHOLD = 0.92
 CLIP_DURATION = 3.0          # seconds — BirdNET operates on 3s windows

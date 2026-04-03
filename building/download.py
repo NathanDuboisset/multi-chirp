@@ -11,13 +11,20 @@ import os
 import time
 from pathlib import Path
 
-import requests
 from dotenv import load_dotenv
+import pyrootutils
+import requests
 from tqdm import tqdm
 
+ROOT = pyrootutils.setup_root(
+    search_from=__file__,
+    indicator="pyproject.toml",
+    pythonpath=True,
+    dotenv=True,
+)
 load_dotenv()
 
-RAW_DATASET_DIR = Path(__file__).parent.parent / "raw_dataset"
+RAW_DATASET_DIR = ROOT / "raw_dataset"
 XC_API_BASE = "https://xeno-canto.org/api/3/recordings"
 ACCEPTED_QUALITY = {"A", "B"}
 

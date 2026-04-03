@@ -98,12 +98,14 @@ def make_audio_datasets(
     sample_rate: int = SAMPLE_RATE,
     batch_size: int = 32,
     seed: int = SEED,
+    class_names: list[str] | None = None,
 ) -> Tuple[tf.data.Dataset, tf.data.Dataset, tf.data.Dataset, np.ndarray]:
     """Create raw train/val/test datasets from the TinyChirp directory layout."""
 
     train_ds_raw = keras.utils.audio_dataset_from_directory(
         root / "training",
         labels="inferred",
+        class_names=class_names,
         sampling_rate=sample_rate,
         batch_size=batch_size,
         shuffle=True,
@@ -112,6 +114,7 @@ def make_audio_datasets(
     val_ds_raw = keras.utils.audio_dataset_from_directory(
         root / "validation",
         labels="inferred",
+        class_names=class_names,
         sampling_rate=sample_rate,
         batch_size=batch_size,
         shuffle=False,
@@ -119,6 +122,7 @@ def make_audio_datasets(
     test_ds_raw = keras.utils.audio_dataset_from_directory(
         root / "testing",
         labels="inferred",
+        class_names=class_names,
         sampling_rate=sample_rate,
         batch_size=batch_size,
         shuffle=False,
@@ -151,6 +155,7 @@ def make_time_datasets(
     root: Path = DATASET_ROOT,
     batch_size: int = 32,
     seed: int = SEED,
+    class_names: list[str] | None = None,
 ) -> Tuple[
     tf.data.Dataset,
     tf.data.Dataset,
@@ -162,7 +167,11 @@ def make_time_datasets(
     """
 
     train_raw, val_raw, test_raw, label_names = make_audio_datasets(
-        root=root, sample_rate=SAMPLE_RATE, batch_size=batch_size, seed=seed
+        root=root,
+        sample_rate=SAMPLE_RATE,
+        batch_size=batch_size,
+        seed=seed,
+        class_names=class_names,
     )
 
     # Compute finite cardinalities before repeating.
@@ -288,7 +297,11 @@ def make_mel_datasets(
         return spec, label
 
     train_raw, val_raw, test_raw, label_names = make_audio_datasets(
-        root=root, sample_rate=SAMPLE_RATE, batch_size=batch_size, seed=seed
+        root=root,
+        sample_rate=SAMPLE_RATE,
+        batch_size=batch_size,
+        seed=seed,
+        class_names=None,
     )
 
     train_ds = train_raw.map(

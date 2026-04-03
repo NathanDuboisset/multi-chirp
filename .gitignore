@@ -14,3 +14,6 @@ src/audio_sample.rs
 *_savedmodel/
 *_saved_model/
 **/__pycache__/*
+
+.env
+raw_dataset/
