@@ -3,7 +3,7 @@ name = "tiny-chirp-microflow-building"
 version = "0.1.0"
 requires-python = ">=3.11,<3.13"
 dependencies = [
-  "tensorflow>=2.10",
+  "tensorflow[and-cuda]>=2.10",
   "numpy",
   "librosa",
   "soundfile",

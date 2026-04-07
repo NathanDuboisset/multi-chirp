@@ -17,3 +17,4 @@ src/audio_sample.rs
 
 .env
 raw_dataset/
+models/

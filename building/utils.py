@@ -685,7 +685,7 @@ def collect_test_clips_for_rs(
         if len(clips_by_label[label_idx]) < num_per_label:
             fixed = fix_audio_length_time(
                 tf.expand_dims(audio_batch, 0)
-            )[0].numpy().astype(np.float32)  # ty:ignore[not-subscriptable]
+            )[0].numpy().astype(np.float32)
             clips_by_label[label_idx].append(fixed)
         if all(len(v) >= num_per_label for v in clips_by_label.values()) and len(
             clips_by_label
