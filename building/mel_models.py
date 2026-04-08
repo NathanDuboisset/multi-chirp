@@ -42,20 +42,14 @@ HIDDEN_SIZE = 8
 
 def build_cnn2d(n_classes: int, input_shape: tuple[int, int, int] = MEL_INPUT_SHAPE) -> Model:
     """Standard 2-D CNN on log-mel spectrogram."""
-    target_frame,num_mel_bins, _ = input_shape
-    end_of_conv1_s1 = (target_frame - CONV_FILTER_SIZE + 1) // 2
-    end_of_conv2_s1 = (end_of_conv1_s1 - CONV_FILTER_SIZE + 1) // 2
-    end_of_conv1_s2 = (num_mel_bins - CONV_FILTER_SIZE + 1) // 2
-    end_of_conv2_s2 = (end_of_conv1_s2 - CONV_FILTER_SIZE + 1) // 2
-
     inp = layers.Input(shape=input_shape, name="mel_spectrogram")
     x = layers.Conv2D(N_CHANNELS, (3, 3), activation="relu", padding="same")(inp)
     x = layers.MaxPooling2D((2, 2))(x)
     x = layers.Conv2D(N_CHANNELS, (3, 3), activation="relu", padding="same")(x)
     x = layers.MaxPooling2D((2, 2))(x)
-    x = layers.Reshape((end_of_conv2_s2, end_of_conv2_s1, N_CHANNELS))(x)
+    x = layers.Flatten()(x)
     x = layers.Dense(HIDDEN_SIZE, activation="relu")(x)
-    x = layers.Dropout(0.4)(x)
+    x = layers.Dropout(0.2)(x)
     out = layers.Dense(n_classes, activation="sigmoid", name="predictions")(x)
     return _compile(Model(inp, out, name="cnn2d_mel"))
 

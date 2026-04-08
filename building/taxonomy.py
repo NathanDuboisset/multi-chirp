@@ -208,20 +208,6 @@ def select_same_order(order: str, n: int, species_pool: Optional[list[SpeciesInf
     return selected
 
 
-def select_diff_order(n: int, species_pool: Optional[list[SpeciesInfo]] = None) -> list[SpeciesInfo]:
-    pool = species_pool or get_species_with_recordings()
-    seen_orders: set[str] = set()
-    selected: list[SpeciesInfo] = []
-    for s in sorted(pool, key=lambda s: -s.num_recordings):
-        if s.order not in seen_orders:
-            seen_orders.add(s.order)
-            selected.append(s)
-        if len(selected) == n:
-            break
-    if len(selected) < n:
-        raise ValueError(f"Only {len(selected)} distinct orders found, need {n}")
-    return selected
-
 
 def get_potential_taxa(
     taxon_level: str,

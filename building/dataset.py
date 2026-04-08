@@ -122,6 +122,7 @@ def build_dataset(
     collection_name: str,
     species_names: list[str],
     clips_per_species: int | None = None,
+    max_class_size_training: int | None = None,
     split: tuple[float, float, float] = SPLIT,
     subsamples_dir: Path | None = None,
 ) -> Path:
@@ -146,6 +147,8 @@ def build_dataset(
         val = shuffled[n_train : n_train + n_val]
         tst = shuffled[n_train + n_val :]
         for subset, files in zip(splits, [train, val, tst]):
+            if max_class_size_training is not None:
+                files = files[:max_class_size_training]
             dest = dataset_root / subset / folder
             dest.mkdir(parents=True, exist_ok=True)
             for f in files:
@@ -159,6 +162,7 @@ def build_dataset(
 def validate_and_build_all(
     collections: dict[str, list[str]],
     clips_per_species: int | None = None,
+    max_class_size_training: int | None = None,
     threshold: float = BIRDNET_THRESHOLD,
 ) -> dict[str, Path]:
     SUBSAMPLES_DIR.mkdir(parents=True, exist_ok=True)
@@ -176,6 +180,7 @@ def validate_and_build_all(
             coll_name,
             names,
             clips_per_species=clips_per_species,
+            max_class_size_training=max_class_size_training,
             subsamples_dir=SUBSAMPLES_DIR / coll_name,
         )
         results[coll_name] = path
