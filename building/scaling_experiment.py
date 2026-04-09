@@ -64,6 +64,7 @@ class BaselineRunResult(BaseRunResult):
     target_idx: int
     recall: float
     precision: float
+    top1_accuracy: float
 
 
 class ScalingResult(BaseRunResult):
@@ -89,13 +90,14 @@ _run_result_adapter = TypeAdapter(RunResult)
 class BaselineSummary(BaseModel):
     recall: float
     precision: float
+    top1_accuracy: float
 
 
 FIT_VERBOSE = 2
 SHUFFLE_BUFFER_CAP = 1024
 
 
-def _configure_tf_for_long_runs() -> None:
+def configure_tf_for_long_runs() -> None:
     # Disable XLA JIT to reduce long-run memory growth in notebook loops.
     try:
         tf.config.optimizer.set_jit(False)
@@ -110,13 +112,7 @@ def _configure_tf_for_long_runs() -> None:
         pass
 
 
-_configure_tf_for_long_runs()
-
-
-def _empty_input_shape(input_repr: Literal["time", "mel"]) -> tuple[int, ...]:
-    if input_repr == "time":
-        return (TARGET_AUDIO_LEN, 1)
-    return MEL_INPUT_SHAPE
+configure_tf_for_long_runs()
 
 
 def _dataset_to_arrays(
@@ -156,7 +152,7 @@ def load_full_arrays(
             seed=seed,
             class_names=None,
         )
-    input_shape = _empty_input_shape(input_repr)
+    input_shape = (TARGET_AUDIO_LEN, 1) if input_repr == "time" else MEL_INPUT_SHAPE
     x_train, y_train = _dataset_to_arrays(train_ds, input_shape)
     x_val, y_val = _dataset_to_arrays(val_ds, input_shape)
     x_test, y_test = _dataset_to_arrays(test_ds, input_shape)
@@ -291,11 +287,6 @@ def _compute_metrics(
     }
 
 
-def _cleanup_after_fit() -> None:
-    tf.keras.backend.clear_session()
-    gc.collect()
-
-
 def load_results(results_file: Path) -> list[RunResult]:
     if not results_file.exists():
         return []
@@ -320,20 +311,14 @@ def run_experiments(
     existing = load_results(config.results_file)
     produced: list[RunResult] = []
 
-    def _is_done(run_type: Literal["baseline", "scaling"], **keys: object) -> bool:
+    def is_done(run_type: Literal["baseline", "scaling"], **keys: object) -> bool:
         return any(
             r.run_type == run_type
             and all(getattr(r, k, None) == v for k, v in keys.items())
             for r in existing
         )
 
-    def _save(row: RunResult) -> None:
-        with config.results_file.open("a", encoding="utf-8") as f:
-            f.write(row.model_dump_json() + "\n")
-        existing.append(row)
-        produced.append(row)
-
-    def _fit_eval_cleanup(
+    def fit_eval(
         chosen_idxs: list[int],
         model_name: str,
         run_type: Literal["baseline", "scaling"],
@@ -403,8 +388,9 @@ def run_experiments(
                     run_type="baseline",
                     recall=m["recall_mean"],
                     precision=m["precision_mean"],
+                    top1_accuracy=m["top1_accuracy"],
                     **common,
-                )  # type: ignore
+                )
             else:
                 res = ScalingResult(
                     run_type="scaling",
@@ -413,21 +399,25 @@ def run_experiments(
                     per_class_precision_mean=m["precision_mean"],
                     per_class_precision_std=m["precision_std"],
                     top1_accuracy=m["top1_accuracy"],
-                    **common,  # type: ignore
+                    **common,
                 )
-            _save(res)
+            with config.results_file.open("a", encoding="utf-8") as f:
+                f.write(res.model_dump_json() + "\n")
+            existing.append(res)
+            produced.append(res)
         finally:
             del model, history
-            _cleanup_after_fit()
+            tf.keras.backend.clear_session()
+            gc.collect()
 
     if run_baseline:
         baseline_dir = config.models_dir / "scaling_1"
         baseline_dir.mkdir(parents=True, exist_ok=True)
         for target_idx, target_name in enumerate(arrays.class_names):
-            if _is_done("baseline", target_class=target_name):
+            if is_done("baseline", target_class=target_name):
                 continue
             print(f"[baseline] target={target_name}")
-            _fit_eval_cleanup(
+            fit_eval(
                 [target_idx],
                 f"sample_{target_idx}",
                 "baseline",
@@ -442,15 +432,15 @@ def run_experiments(
             scaling_dir = config.models_dir / f"scaling_{k}"
             scaling_dir.mkdir(parents=True, exist_ok=True)
             for sample_idx in range(n_samples):
-                if _is_done("scaling", k=k, sample_idx=sample_idx):
+                if is_done("scaling", k=k, sample_idx=sample_idx):
                     continue
                 chosen_idxs = rng.choice(
                     n_classes_total, size=k, replace=False
                 ).tolist()
                 chosen_names = [arrays.class_names[i] for i in chosen_idxs]
                 print(f"[scaling] k={k} sample={sample_idx + 1}/{n_samples}")
-                sample_name = chosen_idxs.join("_")
-                _fit_eval_cleanup(
+                sample_name = "_".join(str(i) for i in chosen_idxs)
+                fit_eval(
                     chosen_idxs,
                     f"sample_{sample_name}",
                     "scaling",
@@ -469,7 +459,9 @@ def run_experiments(
 def summarize_results(results_file: Path) -> tuple[BaselineSummary, pd.DataFrame]:
     rows = load_results(results_file)
     if not rows:
-        return BaselineSummary(recall=0.0, precision=0.0), pd.DataFrame(
+        return BaselineSummary(
+            recall=0.0, precision=0.0, top1_accuracy=0.0
+        ), pd.DataFrame(
             columns=[
                 "k",
                 "recall_mean",
@@ -485,11 +477,15 @@ def summarize_results(results_file: Path) -> tuple[BaselineSummary, pd.DataFrame
     baseline_precision_vals = [
         r.precision for r in rows if isinstance(r, BaselineRunResult)
     ]
+    baseline_top1_vals = [
+        r.top1_accuracy for r in rows if isinstance(r, BaselineRunResult)
+    ]
     baseline = BaselineSummary(
         recall=float(np.mean(baseline_vals)) if baseline_vals else 0.0,
         precision=float(np.mean(baseline_precision_vals))
         if baseline_precision_vals
         else 0.0,
+        top1_accuracy=float(np.mean(baseline_top1_vals)) if baseline_top1_vals else 0.0,
     )
 
     scaling_rows = [r.model_dump() for r in rows if isinstance(r, ScalingResult)]
@@ -566,13 +562,13 @@ def plot_summary(
             "title": "Top-1 Accuracy",
             "mean": summary_df["top1_acc_mean"].to_numpy(),
             "std": summary_df["top1_acc_std"].to_numpy(),
-            "baseline_val": None,  # top-1 not tracked in BaselineSummary; extend if needed
+            "baseline_val": baseline.top1_accuracy if baseline else None,
             "color": "seagreen",
             "marker": "^",
         },
     ]
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4), sharey=False)
+    fig, axes = plt.subplots(3, 1, figsize=(15, 15), sharey=False)
     fig.suptitle("Scaling results by k", fontsize=13, fontweight="bold")
 
     for ax, m in zip(axes, metrics):

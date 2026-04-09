@@ -80,90 +80,74 @@ def _query_xc_recording_count(genus: str, epithet: str, api_key: str) -> int:
         return 0
 
 
-def _load_or_build_cache(
+def get_species_with_recordings(
     min_recordings: int = 100,
-    max_species: Optional[int] = None,
     force_refresh: bool = False,
-    dl_more: bool = True,
+    dl_more: bool = False,
 ) -> list[SpeciesInfo]:
     RAW_DATASET_DIR.mkdir(parents=True, exist_ok=True)
 
-    cached_data = {}
     if force_refresh and TAXONOMY_CACHE.exists():
         TAXONOMY_CACHE.unlink()
-    if TAXONOMY_CACHE.exists() and not force_refresh:
+
+    cached_data: dict[str, dict] = {}
+    if TAXONOMY_CACHE.exists():
         try:
             for _, row in pd.read_csv(TAXONOMY_CACHE).iterrows():
                 cached_data[row["scientific_name"]] = row.to_dict()
         except Exception as e:
-            print(f"Could not load existing cache: {e}")
+            print(f"Could not load cache: {e}")
+
+    if not dl_more:
+        return [
+            SpeciesInfo(**d) for d in cached_data.values()
+            if d.get("num_recordings", 0) >= min_recordings
+        ]
 
     api_key = os.getenv("XC_API_KEY", "demo")
     df = _fetch_ebird_taxonomy()
-    if max_species:
-        df = df.head(max_species)
-    if dl_more and not api_key:
-        raise ValueError("XC_API_KEY is not set")
+    uncached = df[~df["scientific_name"].isin(cached_data)]
+    if uncached.empty:
+        return [
+            SpeciesInfo(**d) for d in cached_data.values()
+            if d.get("num_recordings", 0) >= min_recordings
+        ]
 
-    results: list[SpeciesInfo] = []
-    
-    new_queries = 0
-    total_species = len(df)
+    pending: list[dict] = []
 
-    pending_rows: list[dict] = []
-
-    def flush_pending_rows() -> None:
-        if not pending_rows:
+    def _flush() -> None:
+        if not pending:
             return
-        # Append only newly queried rows to avoid rewriting the full CSV.
-        pd.DataFrame(pending_rows).to_csv(
-            TAXONOMY_CACHE,
-            mode="a",
-            index=False,
-            header=not TAXONOMY_CACHE.exists(),
+        pd.DataFrame(pending).to_csv(
+            TAXONOMY_CACHE, mode="a", index=False, header=not TAXONOMY_CACHE.exists()
         )
-        pending_rows.clear()
-    
-    pbar = tqdm(df.iterrows(), total=total_species, desc="Species")
+        pending.clear()
+
+    pbar = tqdm(uncached.iterrows(), total=len(uncached), desc="Querying XC")
     for _, row in pbar:
         sci_name = row["scientific_name"]
-        
-        if sci_name in cached_data and not force_refresh:
-            s_info = SpeciesInfo(**cached_data[sci_name])
-            pbar.set_description(f"{sci_name} (cached)")
-        elif dl_more:
-            pbar.set_description(f"{sci_name} (querying)")
-            count = _query_xc_recording_count(row["genus"], row["species_epithet"], api_key)
-            pbar.set_postfix(found=count)
-            time.sleep(0.5)  # be polite to the API
-            
-            s_info = SpeciesInfo(
-                scientific_name=sci_name,
-                genus=row["genus"],
-                species_epithet=row["species_epithet"],
-                family=row["family"],
-                order=row["order"],
-                num_recordings=count,
-            )
-            cached_data[sci_name] = s_info.model_dump()
-            new_queries += 1
-            pending_rows.append(cached_data[sci_name])
-            if len(pending_rows) >= 10:
-                flush_pending_rows()
-        else:
-            pbar.set_description(f"{sci_name} (missing in cache)")
-            continue
+        pbar.set_description(sci_name)
+        count = _query_xc_recording_count(row["genus"], row["species_epithet"], api_key)
+        pbar.set_postfix(found=count)
+        time.sleep(0.5)
+        entry = dict(
+            scientific_name=sci_name,
+            genus=row["genus"],
+            species_epithet=row["species_epithet"],
+            family=row["family"],
+            order=row["order"],
+            num_recordings=count,
+        )
+        cached_data[sci_name] = entry
+        pending.append(entry)
+        if len(pending) >= 10:
+            _flush()
+    _flush()
 
-        results.append(s_info)
-
-    # Flush any remaining newly queried rows.
-    flush_pending_rows()
-
-    return [s for s in results if s.num_recordings >= min_recordings]
-
-
-def get_species_with_recordings(min_recordings: int = 100, force_refresh: bool = False, dl_more: bool = True) -> list[SpeciesInfo]:
-    return _load_or_build_cache(min_recordings=min_recordings, force_refresh=force_refresh, dl_more=dl_more)
+    return [
+        SpeciesInfo(**d) for d in cached_data.values()
+        if d.get("num_recordings", 0) >= min_recordings
+    ]
 
 
 def select_same_genus(genus: str, n: int, species_pool: Optional[list[SpeciesInfo]] = None) -> list[SpeciesInfo]:

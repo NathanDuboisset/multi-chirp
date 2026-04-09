@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import gc
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Tuple, TYPE_CHECKING
 
 import numpy as np
 import tensorflow as tf
-import pandas as pd
 from pandas import DataFrame
+
 if TYPE_CHECKING:
     import keras
 else:
@@ -125,7 +126,7 @@ def _per_class_positive_accuracy(
         if preds.shape[-1] != n_classes:
             raise ValueError(f"expected {n_classes} outputs, got {preds.shape[-1]}")
         for c in range(n_classes):
-            mask = (y == c)
+            mask = y == c
             if not np.any(mask):
                 continue
             probs_c = preds[mask, c]
@@ -162,24 +163,36 @@ def train_and_evaluate_scaling(
     if max_n < 2:
         raise ValueError("max_n must be at least 2")
     if max_n > len(all_classes):
-        raise ValueError(f"max_n={max_n} but only {len(all_classes)} classes are available")
+        raise ValueError(
+            f"max_n={max_n} but only {len(all_classes)} classes are available"
+        )
 
     # Binary baseline: target vs all others, positives-only accuracy, computed once.
     if baseline_targets is None or baseline_targets >= len(all_classes):
         baseline_targets_list = all_classes
     else:
-        baseline_targets_list = list(rng.choice(all_classes, size=baseline_targets, replace=False))
+        baseline_targets_list = list(
+            rng.choice(all_classes, size=baseline_targets, replace=False)
+        )
 
     _, _, test_full = make_datasets_fn(dataset_root, all_classes, batch_size)
     baseline_accs: List[float] = []
 
     for target_name in baseline_targets_list:
         target_index = all_classes.index(target_name)
-        train_full, val_full, test_full_local = make_datasets_fn(dataset_root, all_classes, batch_size)
+        train_full, val_full, test_full_local = make_datasets_fn(
+            dataset_root, all_classes, batch_size
+        )
 
-        train_bin = _build_binary_dataset(train_full, target_index, neg_pos_ratio, batch_size, rng)
-        val_bin = _build_binary_dataset(val_full, target_index, neg_pos_ratio, batch_size, rng)
-        test_bin = _build_binary_dataset(test_full_local, target_index, neg_pos_ratio, batch_size, rng)
+        train_bin = _build_binary_dataset(
+            train_full, target_index, neg_pos_ratio, batch_size, rng
+        )
+        val_bin = _build_binary_dataset(
+            val_full, target_index, neg_pos_ratio, batch_size, rng
+        )
+        test_bin = _build_binary_dataset(
+            test_full_local, target_index, neg_pos_ratio, batch_size, rng
+        )
 
         input_shape = _infer_input_shape(train_bin)
         model = build_model_fn(input_shape, 1)
@@ -204,11 +217,14 @@ def train_and_evaluate_scaling(
             labels = y_batch.numpy().reshape(-1)
             y_true.append(labels)
             y_score.append(preds)
+        del model, train_bin, val_bin, test_bin, train_full, val_full, test_full_local
+        tf.keras.backend.clear_session()
+        gc.collect()
         if not y_true:
             continue
         y_true_arr = np.concatenate(y_true, axis=0)
         y_score_arr = np.concatenate(y_score, axis=0)
-        pos_mask = (y_true_arr == 1.0)
+        pos_mask = y_true_arr == 1.0
         if not np.any(pos_mask):
             continue
         pos_scores = y_score_arr[pos_mask]
@@ -254,6 +270,9 @@ def train_and_evaluate_scaling(
                 n_classes=k,
             )
             run_scores.append(score)
+            del model, train_ds, val_ds, test_ds
+            tf.keras.backend.clear_session()
+            gc.collect()
 
         if not run_scores:
             rows.append(
@@ -296,4 +315,3 @@ def plot_scaling(df: "DataFrame", baseline: float | None = None) -> None:
     plt.legend()
     plt.tight_layout()
     plt.show()
-
