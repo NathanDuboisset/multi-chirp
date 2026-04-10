@@ -18,6 +18,7 @@ from birdnetlib import Recording
 from birdnetlib.analyzer import Analyzer as ModelAnalyzer
 from dotenv import load_dotenv
 import librosa
+from building.taxonomy import MINIMUM_QUALITY, XC_QUALITY_FILTER
 import numpy as np
 import pyrootutils
 import requests
@@ -268,7 +269,7 @@ async def _fetch_listing(
     if listing_path.exists():
         return _read_csv(listing_path)
 
-    query = f'sp:"{scientific_name}" grp:birds q:A'
+    query = f'sp:"{scientific_name}" grp:birds {XC_QUALITY_FILTER[MINIMUM_QUALITY]}'
     rows: list[dict[str, str]] = []
     page = 1
     key = os.getenv("XC_API_KEY", "demo")

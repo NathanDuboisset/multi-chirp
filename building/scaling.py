@@ -388,7 +388,7 @@ def run_experiments(
                     )
                 ],
             )
-            test_loss = float(model.evaluate(test_ds, verbose=0)[0])
+            test_loss = float(model.evaluate(test_ds, verbose=0)[0])  # ty:ignore[not-subscriptable]
             y_true, y_pred = _collect_predictions(model, test_ds)
             m = _compute_metrics(y_true, y_pred, config.threshold, test_loss)
 
@@ -410,7 +410,7 @@ def run_experiments(
                 **extra,
             }
             res_cls = BaselineRunResult if run_type == "baseline" else ScalingResult
-            res = res_cls(run_type=run_type, metrics=m, **common)
+            res = res_cls(run_type=run_type, metrics=m, **common)  # ty:ignore[invalid-argument-type]
             with config.results_file.open("a", encoding="utf-8") as f:
                 f.write(res.model_dump_json() + "\n")
             existing.append(res)
@@ -477,6 +477,8 @@ def summarize_results(results_file: Path) -> tuple[BaselineSummary, pd.DataFrame
             "f1_std",
             "top1_acc_mean",
             "top1_acc_std",
+            "loss_mean",
+            "loss_std",
         ]
     )
     if not rows:

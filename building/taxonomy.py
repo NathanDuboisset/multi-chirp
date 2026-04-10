@@ -34,19 +34,42 @@ RAW_DATASET_DIR = ROOT / "raw_dataset"
 TAXONOMY_CACHE = RAW_DATASET_DIR / "taxonomy_cache.csv"
 XC_API_BASE = "https://xeno-canto.org/api/3/recordings"
 
+MINIMUM_QUALITY: str = "A"
+
+XC_QUALITY_FILTER: dict[str, str] = {
+    "A": "q:A",
+    "B": 'q:">C"',
+    "C": 'q:">D"',
+}
+
 
 class SpeciesInfo(BaseModel):
-    scientific_name: str  # "Genus species"
+    scientific_name: str
     genus: str
     species_epithet: str
     family: str
     order: str
-    num_recordings: int
+    num_recordings_a: int = 0
+    num_recordings_b: int = 0
+    num_recordings_c: int = 0
+
+    def recordings_at_least(self, min_quality: str = MINIMUM_QUALITY) -> int:
+        """Cumulative count for quality >= min_quality (A ⊇ B ⊇ C)."""
+        total = self.num_recordings_a
+        if min_quality in ("B", "C"):
+            total += self.num_recordings_b
+        if min_quality == "C":
+            total += self.num_recordings_c
+        return total
+
+    @property
+    def num_recordings(self) -> int:
+        return self.recordings_at_least(MINIMUM_QUALITY)
 
 
 def _fetch_ebird_taxonomy() -> pd.DataFrame:
     taxonomy_file = RAW_DATASET_DIR / "taxonomy.csv"
-    
+
     if not taxonomy_file.exists():
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         resp = requests.get(EBIRD_TAXONOMY_URL, headers=headers, timeout=60)
@@ -54,9 +77,9 @@ def _fetch_ebird_taxonomy() -> pd.DataFrame:
         RAW_DATASET_DIR.mkdir(parents=True, exist_ok=True)
         with open(taxonomy_file, "w", encoding="utf-8") as f:
             f.write(resp.text)
-            
+
     df = pd.read_csv(taxonomy_file)
-    
+
     df = df[df["CATEGORY"] == "species"].copy()
     df = df[["ORDER", "FAMILY", "SCI_NAME"]].copy()
     df.columns = ["order", "family", "scientific_name"]
@@ -65,19 +88,40 @@ def _fetch_ebird_taxonomy() -> pd.DataFrame:
     return df.dropna(subset=["genus", "species_epithet"])
 
 
-def _query_xc_recording_count(genus: str, epithet: str, api_key: str) -> int:
-    params = {
-        "query": f'sp:"{genus} {epithet}" grp:birds',
-        "key": api_key,
-        "per_page": 1,
-    }
+def _query_xc_counts(genus: str, epithet: str, api_key: str) -> dict[str, int]:
+    """Query XC for quality-A, B, C recording counts. Returns {a, b, c}."""
+    counts: dict[str, int] = {"a": 0, "b": 0, "c": 0}
+    for key_q, q_filter in (("a", "q:A"), ("b", "q:B"), ("c", "q:C")):
+        try:
+            resp = requests.get(
+                XC_API_BASE,
+                params={
+                    "query": f'sp:"{genus} {epithet}" grp:birds {q_filter}',
+                    "key": api_key,
+                    "per_page": 1,
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            counts[key_q] = int(resp.json().get("numRecordings", 0))
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return counts
+
+
+def _load_cache() -> dict[str, dict]:
+    cached: dict[str, dict] = {}
+    if not TAXONOMY_CACHE.exists():
+        return cached
     try:
-        resp = requests.get(XC_API_BASE, params=params, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        return int(data.get("numRecordings", 0))
-    except Exception:
-        return 0
+        df = pd.read_csv(TAXONOMY_CACHE)
+        for _, row in df.iterrows():
+            d = row.to_dict()
+            cached[d["scientific_name"]] = d
+    except Exception as e:
+        print(f"Could not load cache: {e}")
+    return cached
 
 
 def get_species_with_recordings(
@@ -90,18 +134,19 @@ def get_species_with_recordings(
     if force_refresh and TAXONOMY_CACHE.exists():
         TAXONOMY_CACHE.unlink()
 
-    cached_data: dict[str, dict] = {}
-    if TAXONOMY_CACHE.exists():
+    cached_data = _load_cache()
+
+    def _to_species(d: dict) -> Optional[SpeciesInfo]:
         try:
-            for _, row in pd.read_csv(TAXONOMY_CACHE).iterrows():
-                cached_data[row["scientific_name"]] = row.to_dict()
-        except Exception as e:
-            print(f"Could not load cache: {e}")
+            return SpeciesInfo(**d)
+        except Exception:
+            return None
 
     if not dl_more:
         return [
-            SpeciesInfo(**d) for d in cached_data.values()
-            if d.get("num_recordings", 0) >= min_recordings
+            s
+            for d in cached_data.values()
+            if (s := _to_species(d)) and s.num_recordings >= min_recordings
         ]
 
     api_key = os.getenv("XC_API_KEY", "demo")
@@ -109,8 +154,9 @@ def get_species_with_recordings(
     uncached = df[~df["scientific_name"].isin(cached_data)]
     if uncached.empty:
         return [
-            SpeciesInfo(**d) for d in cached_data.values()
-            if d.get("num_recordings", 0) >= min_recordings
+            s
+            for d in cached_data.values()
+            if (s := _to_species(d)) and s.num_recordings >= min_recordings
         ]
 
     pending: list[dict] = []
@@ -127,16 +173,17 @@ def get_species_with_recordings(
     for _, row in pbar:
         sci_name = row["scientific_name"]
         pbar.set_description(sci_name)
-        count = _query_xc_recording_count(row["genus"], row["species_epithet"], api_key)
-        pbar.set_postfix(found=count)
-        time.sleep(0.5)
+        counts = _query_xc_counts(row["genus"], row["species_epithet"], api_key)
+        pbar.set_postfix(A=counts["a"], B=counts["b"], C=counts["c"])
         entry = dict(
             scientific_name=sci_name,
             genus=row["genus"],
             species_epithet=row["species_epithet"],
             family=row["family"],
             order=row["order"],
-            num_recordings=count,
+            num_recordings_a=counts["a"],
+            num_recordings_b=counts["b"],
+            num_recordings_c=counts["c"],
         )
         cached_data[sci_name] = entry
         pending.append(entry)
@@ -145,24 +192,46 @@ def get_species_with_recordings(
     _flush()
 
     return [
-        SpeciesInfo(**d) for d in cached_data.values()
-        if d.get("num_recordings", 0) >= min_recordings
+        s
+        for d in cached_data.values()
+        if (s := _to_species(d)) and s.num_recordings >= min_recordings
     ]
 
 
-def select_same_genus(genus: str, n: int, species_pool: Optional[list[SpeciesInfo]] = None) -> list[SpeciesInfo]:
+def select_same_genus(
+    genus: str,
+    n: int,
+    species_pool: Optional[list[SpeciesInfo]] = None,
+    avoid: Optional[list[str]] = None,
+) -> list[SpeciesInfo]:
     pool = species_pool or get_species_with_recordings()
-    candidates = [s for s in pool if s.genus.lower() == genus.lower()]
+    avoid_set = set(avoid or [])
+    candidates = [
+        s
+        for s in pool
+        if s.genus.lower() == genus.lower() and s.scientific_name not in avoid_set
+    ]
     if len(candidates) < n:
-        raise ValueError(f"Only {len(candidates)} species found for genus {genus}, need {n}")
+        raise ValueError(
+            f"Only {len(candidates)} species found for genus {genus}, need {n}"
+        )
     candidates.sort(key=lambda s: -s.num_recordings)
     return candidates[:n]
 
 
-def select_same_family(family: str, n: int, species_pool: Optional[list[SpeciesInfo]] = None) -> list[SpeciesInfo]:
+def select_same_family(
+    family: str,
+    n: int,
+    species_pool: Optional[list[SpeciesInfo]] = None,
+    avoid: Optional[list[str]] = None,
+) -> list[SpeciesInfo]:
     pool = species_pool or get_species_with_recordings()
-    candidates = [s for s in pool if s.family.lower() == family.lower()]
-    # Pick one species per genus (different genera)
+    avoid_set = set(avoid or [])
+    candidates = [
+        s
+        for s in pool
+        if s.family.lower() == family.lower() and s.scientific_name not in avoid_set
+    ]
     seen_genera: set[str] = set()
     selected: list[SpeciesInfo] = []
     for s in sorted(candidates, key=lambda s: -s.num_recordings):
@@ -172,13 +241,25 @@ def select_same_family(family: str, n: int, species_pool: Optional[list[SpeciesI
         if len(selected) == n:
             break
     if len(selected) < n:
-        raise ValueError(f"Only {len(selected)} distinct genera found in family {family}, need {n}")
+        raise ValueError(
+            f"Only {len(selected)} distinct genera found in family {family}, need {n}"
+        )
     return selected
 
 
-def select_same_order(order: str, n: int, species_pool: Optional[list[SpeciesInfo]] = None) -> list[SpeciesInfo]:
+def select_same_order(
+    order: str,
+    n: int,
+    species_pool: Optional[list[SpeciesInfo]] = None,
+    avoid: Optional[list[str]] = None,
+) -> list[SpeciesInfo]:
     pool = species_pool or get_species_with_recordings()
-    candidates = [s for s in pool if s.order.lower() == order.lower()]
+    avoid_set = set(avoid or [])
+    candidates = [
+        s
+        for s in pool
+        if s.order.lower() == order.lower() and s.scientific_name not in avoid_set
+    ]
     seen_families: set[str] = set()
     selected: list[SpeciesInfo] = []
     for s in sorted(candidates, key=lambda s: -s.num_recordings):
@@ -188,9 +269,36 @@ def select_same_order(order: str, n: int, species_pool: Optional[list[SpeciesInf
         if len(selected) == n:
             break
     if len(selected) < n:
-        raise ValueError(f"Only {len(selected)} distinct families found in order {order}, need {n}")
+        raise ValueError(
+            f"Only {len(selected)} distinct families found in order {order}, need {n}"
+        )
     return selected
 
+
+def _min_top_n_rec(items: list[SpeciesInfo], taxon_level: str, n: int) -> Optional[int]:
+    """Simulate the greedy top-N selection and return the min recording count."""
+    sorted_items = sorted(items, key=lambda s: -s.num_recordings)
+    if taxon_level == "genus":
+        selected = sorted_items[:n]
+    elif taxon_level == "family":
+        seen: set[str] = set()
+        selected = []
+        for s in sorted_items:
+            if s.genus not in seen:
+                seen.add(s.genus)
+                selected.append(s)
+            if len(selected) == n:
+                break
+    else:  # order
+        seen_fam: set[str] = set()
+        selected = []
+        for s in sorted_items:
+            if s.family not in seen_fam:
+                seen_fam.add(s.family)
+                selected.append(s)
+            if len(selected) == n:
+                break
+    return min(s.num_recordings for s in selected) if len(selected) >= n else None
 
 
 def get_potential_taxa(
@@ -243,7 +351,7 @@ def get_potential_taxa(
                     "n_distinct_genus": n_distinct_genus,
                     "n_distinct_family": n_distinct_family,
                     "n_distinct_order": n_distinct_order,
-                    # used for sorting/debugging
+                    "min_top_n_rec": _min_top_n_rec(items, taxon_level_lower, n),
                     "_required_metric": required_metric,
                     "_required_value": required_value,
                 }
@@ -259,6 +367,7 @@ def get_potential_taxa(
                 "n_distinct_genus",
                 "n_distinct_family",
                 "n_distinct_order",
+                "min_top_n_rec",
             ]
         )
 
@@ -268,7 +377,9 @@ def get_potential_taxa(
         "order": "n_distinct_family",
     }[taxon_level_lower]
 
-    df = df.sort_values([required_col, "n_species"], ascending=[False, False]).reset_index(drop=True)
+    df = df.sort_values(
+        [required_col, "n_species"], ascending=[False, False]
+    ).reset_index(drop=True)
     if top_k:
         df = df.head(top_k).reset_index(drop=True)
 
@@ -279,4 +390,6 @@ if __name__ == "__main__":
     pool = get_species_with_recordings()
     print(f"Species with ≥100 XC recordings: {len(pool)}")
     for s in pool[:10]:
-        print(f"  {s.scientific_name:40s}  order={s.order}  family={s.family}  n={s.num_recordings}")
+        print(
+            f"  {s.scientific_name:40s}  order={s.order}  family={s.family}  n={s.num_recordings}"
+        )
