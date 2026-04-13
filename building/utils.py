@@ -4,15 +4,14 @@ from dataclasses import dataclass
 from pathlib import Path
 import os
 import random
-from typing import Any, Callable, Iterable, List, Tuple, TYPE_CHECKING, cast
+from typing import Callable, Iterable, List, Tuple, TYPE_CHECKING
 
 import numpy as np
 import tensorflow as tf
-from tqdm import tqdm
+
 if TYPE_CHECKING:
     import keras
 else:
-    
     keras = tf.keras
 
 # GLOBAL CONFIGURATION / PATHS
@@ -86,11 +85,12 @@ TARGET_AUDIO_LEN_TIME = (TARGET_FRAMES_TIME - 1) * FRAME_STEP + FRAME_LENGTH
 
 # CNN mel
 FFT_LENGTH_MEL = FRAME_LENGTH
-NUM_MEL_BINS_MEL = 80 
+NUM_MEL_BINS_MEL = 80
 LOWER_EDGE_HERTZ = 80.0
 UPPER_EDGE_HERTZ = 8000.0
-TARGET_FRAMES_MEL = 184 
+TARGET_FRAMES_MEL = 184
 TARGET_AUDIO_LEN_MEL = (TARGET_FRAMES_MEL - 1) * FRAME_STEP + FRAME_LENGTH
+
 
 # DATASET HELPERS
 def make_audio_datasets(
@@ -140,7 +140,7 @@ def fix_audio_length_time(audio: tf.Tensor) -> tf.Tensor:
     audio = audio[:, :TARGET_AUDIO_LEN_TIME]
     current_len = tf.shape(audio)[1]
     pad_len = tf.maximum(0, TARGET_AUDIO_LEN_TIME - current_len)
-    audio = tf.pad(audio, [[0, 0], [0, pad_len]])
+    audio = tf.pad(audio, [[0, 0], [0, pad_len]])  # ty:ignore[invalid-argument-type]
     audio = tf.ensure_shape(audio, [None, TARGET_AUDIO_LEN_TIME])
     audio = tf.expand_dims(audio, axis=-1)  # [batch, time, 1]
     return audio
@@ -175,18 +175,15 @@ def make_time_datasets(
     )
 
     # Compute finite cardinalities before repeating.
-    train_ds = (
-        train_raw.map(time_to_features, num_parallel_calls=tf.data.AUTOTUNE)
-        .prefetch(2)
-    )
-    val_ds = (
-        val_raw.map(time_to_features, num_parallel_calls=tf.data.AUTOTUNE)
-        .prefetch(2)
-    )
-    test_ds = (
-        test_raw.map(time_to_features, num_parallel_calls=tf.data.AUTOTUNE)
-        .prefetch(2)
-    )
+    train_ds = train_raw.map(
+        time_to_features, num_parallel_calls=tf.data.AUTOTUNE
+    ).prefetch(2)
+    val_ds = val_raw.map(
+        time_to_features, num_parallel_calls=tf.data.AUTOTUNE
+    ).prefetch(2)
+    test_ds = test_raw.map(
+        time_to_features, num_parallel_calls=tf.data.AUTOTUNE
+    ).prefetch(2)
 
     return train_ds, val_ds, test_ds, label_names
 
@@ -248,7 +245,7 @@ def fix_audio_length_mel(audio: tf.Tensor) -> tf.Tensor:
     audio = audio[:, :TARGET_AUDIO_LEN_MEL]
     current_len = tf.shape(audio)[1]
     pad_len = tf.maximum(0, TARGET_AUDIO_LEN_MEL - current_len)
-    audio = tf.pad(audio, [[0, 0], [0, pad_len]])
+    audio = tf.pad(audio, [[0, 0], [0, pad_len]])  # ty:ignore[invalid-argument-type]
     audio = tf.ensure_shape(audio, [None, TARGET_AUDIO_LEN_MEL])
     return audio
 
@@ -317,8 +314,8 @@ def make_mel_datasets(
     return train_ds, val_ds, test_ds, label_names
 
 
-
 # TFLite export helpers
+
 
 def build_representative_batches(
     dataset: tf.data.Dataset,
@@ -403,13 +400,16 @@ def collect_test_clips_for_rs(
         if label_idx not in clips_by_label:
             clips_by_label[label_idx] = []
         if len(clips_by_label[label_idx]) < num_per_label:
-            fixed = fix_audio_length_time(
-                tf.expand_dims(audio_batch, 0)
-            )[0].numpy().astype(np.float32)
+            fixed = (
+                fix_audio_length_time(tf.expand_dims(audio_batch, 0))[0]
+                .numpy()
+                .astype(np.float32)
+            )
             clips_by_label[label_idx].append(fixed)
-        if all(len(v) >= num_per_label for v in clips_by_label.values()) and len(
-            clips_by_label
-        ) >= 2:
+        if (
+            all(len(v) >= num_per_label for v in clips_by_label.values())
+            and len(clips_by_label) >= 2
+        ):
             break
 
     if len(clips_by_label) < 2:
@@ -421,7 +421,7 @@ def collect_test_clips_for_rs(
         for label_idx in sorted(clips_by_label.keys()):
             label_name = "target" if label_idx == 1 else "non_target"
             audio = clips_by_label[label_idx][i]
-            rel_path = f"dataset/testing/{label_name}/sample_{i+1}.wav"
+            rel_path = f"dataset/testing/{label_name}/sample_{i + 1}.wav"
             ordered.append((label_name, audio, rel_path))
 
     return ordered
@@ -451,11 +451,10 @@ def write_audio_sample_rs(
     rs.append(f"pub const TEST_CLIPS: [TestClip; {len(clips)}] = [\n")
     for i, (label, _audio, rel_path) in enumerate(clips, 1):
         rs.append("    TestClip {\n")
-        rs.append(f"        expected_label: \"{label}\",\n")
-        rs.append(f"        source_file: \"{rel_path}\",\n")
+        rs.append(f'        expected_label: "{label}",\n')
+        rs.append(f'        source_file: "{rel_path}",\n')
         rs.append(f"        audio: CLIP_{i},\n")
         rs.append("    },\n")
     rs.append("];\n")
 
     out_path.write_text("".join(rs), encoding="utf-8")
-

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import gc
+import json
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, Union, Annotated
 from dataclasses import dataclass
@@ -51,15 +52,29 @@ class ScalingRunConfig(BaseModel):
     input_repr: Literal["time", "mel"] = "time"
 
 
-class DatasetArrays(BaseModel):
+@dataclass
+class ClassSplit:
+    """Per-class, per-split cached unbatched dataset (features only, no label)."""
+
+    ds: tf.data.Dataset
+    count: int
+
+
+@dataclass
+class ClassEntry:
+    name: str
+    global_idx: int
+    train: ClassSplit
+    val: ClassSplit
+    test: ClassSplit
+
+
+class DatasetCatalog(BaseModel):
+    """Replaces DatasetArrays: holds per-class cached TF datasets instead of numpy blobs."""
+
     model_config = ConfigDict(arbitrary_types_allowed=True)
-    x_train: np.ndarray
-    y_train: np.ndarray
-    x_val: np.ndarray
-    y_val: np.ndarray
-    x_test: np.ndarray
-    y_test: np.ndarray
     class_names: list[str]
+    entries: list[ClassEntry]  # parallel to class_names
 
 
 class RunMetrics(BaseModel):
@@ -116,150 +131,219 @@ class BaselineSummary(BaseModel):
 @dataclass
 class DatasetMeta:
     n_each: int
-    n_non_target: int
     n_classes: int
 
 
-def _dataset_to_arrays(
-    ds: tf.data.Dataset, input_shape: tuple[int, ...]
-) -> tuple[np.ndarray, np.ndarray]:
-    xs: list[np.ndarray] = []
-    ys: list[np.ndarray] = []
-    for x_batch, y_batch in ds:
-        xs.append(x_batch.numpy())
-        ys.append(y_batch.numpy())
-    if not xs:
-        return np.empty((0, *input_shape), dtype=np.float32), np.empty(
-            (0,), dtype=np.int32
-        )
-    return (
-        np.concatenate(xs, axis=0).astype(np.float32),
-        np.concatenate(ys, axis=0).reshape(-1).astype(np.int32),
-    )
+_CACHE_BATCH = 64  # batch size used only during cache-population pass
 
 
-def load_full_arrays(
+def load_dataset_catalog(
     collection: str,
-    batch_size: int = 32,
-    seed: int = 42,
     input_repr: Literal["time", "mel"] = "time",
-) -> DatasetArrays:
-    from building.mel_models import MEL_INPUT_SHAPE, build_cnn2d  # noqa: F401
-    from building.time_models import TARGET_AUDIO_LEN
-    from building.utils import make_mel_datasets, make_time_datasets
+    # batch_size / seed kept as kwargs so old call-sites don't break
+    batch_size: int = 32,  # noqa: ARG001 – ignored, kept for API compat
+    seed: int = 42,  # noqa: ARG001 – ignored, kept for API compat
+) -> DatasetCatalog:
+    """Build a per-class cached DatasetCatalog.
 
-    dataset_root = ROOT / "datasets" / collection
-    if input_repr == "mel":
-        from building.mel_models import MEL_INPUT_SHAPE
-
-        train_ds, val_ds, test_ds, label_names = make_mel_datasets(
-            root=dataset_root, batch_size=batch_size, seed=seed
-        )
-        input_shape = MEL_INPUT_SHAPE
-    else:
-        train_ds, val_ds, test_ds, label_names = make_time_datasets(
-            root=dataset_root, batch_size=batch_size, seed=seed, class_names=None
-        )
-        input_shape = (TARGET_AUDIO_LEN, 1)
-
-    x_train, y_train = _dataset_to_arrays(train_ds, input_shape)
-    x_val, y_val = _dataset_to_arrays(val_ds, input_shape)
-    x_test, y_test = _dataset_to_arrays(test_ds, input_shape)
-    return DatasetArrays(
-        x_train=x_train,
-        y_train=y_train,
-        x_val=x_val,
-        y_val=y_val,
-        x_test=x_test,
-        y_test=y_test,
-        class_names=label_names.tolist(),
+    On the first call for a given (collection, input_repr) the audio files are
+    read, features are computed and written to
+    ``<root>/.cache/<collection>/<input_repr>/<split>/<class>/``.
+    All subsequent calls re-use the on-disk cache — no audio decoding,
+    no numpy blobs in RAM.
+    """
+    from building.utils import (
+        SAMPLE_RATE,
+        fix_audio_length_time,
+        fix_audio_length_mel,
+        create_log_mel_spectrogram,
+        TARGET_FRAMES_MEL,
+        NUM_MEL_BINS_MEL,
     )
 
+    keras = tf.keras
+    dataset_root = ROOT / "datasets" / collection
+    cache_root = ROOT / ".cache" / collection / input_repr
 
-def _model_factory(
+    if input_repr == "mel":
+
+        def _feature_fn(audio_batch: tf.Tensor) -> tf.Tensor:
+            audio = fix_audio_length_mel(audio_batch)
+            spec = create_log_mel_spectrogram(audio)
+            spec = tf.ensure_shape(spec, [None, TARGET_FRAMES_MEL, NUM_MEL_BINS_MEL])
+            return tf.expand_dims(spec, -1)
+
+    else:
+
+        def _feature_fn(audio_batch: tf.Tensor) -> tf.Tensor:
+            return fix_audio_length_time(audio_batch)
+
+    # Discover classes (sorted so global_idx is stable across calls).
+    training_dir = dataset_root / "training"
+    class_names = sorted(d.name for d in training_dir.iterdir() if d.is_dir())
+
+    def _build_class_split(split_dir_name: str, class_name: str) -> ClassSplit:
+        split_dir = dataset_root / split_dir_name
+        cache_dir = cache_root / split_dir_name / class_name
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = str(cache_dir / "data")
+        count_file = cache_dir / "count.json"
+        cache_index = Path(cache_path + ".index")
+
+        # Remove stale lockfiles left by interrupted previous runs.
+        for lockfile in cache_dir.glob("*.lockfile"):
+            lockfile.unlink(missing_ok=True)
+
+        # Load only this class's audio files; label (always 0) is discarded.
+        ds_raw = keras.utils.audio_dataset_from_directory(
+            split_dir,
+            labels="inferred",
+            class_names=[class_name],
+            sampling_rate=SAMPLE_RATE,
+            batch_size=_CACHE_BATCH,
+            shuffle=False,
+        )
+        ds: tf.data.Dataset = (
+            ds_raw.map(lambda x, _: _feature_fn(x), num_parallel_calls=tf.data.AUTOTUNE)
+            .unbatch()
+            .cache(cache_path)
+        )
+
+        cache_complete = count_file.exists() and cache_index.exists()
+        if not cache_complete:
+            # Wipe any partial cache shards so TF starts from a clean slate.
+            for stale in cache_dir.glob("data*"):
+                stale.unlink(missing_ok=True)
+            count_file.unlink(missing_ok=True)
+
+        if cache_complete:
+            count = json.loads(count_file.read_text())["count"]
+        else:
+            print(f"  caching {split_dir_name}/{class_name} ...", end=" ", flush=True)
+            count = sum(1 for _ in ds)  # triggers the cache-write pass
+            count_file.write_text(json.dumps({"count": count}))
+            print(f"{count} samples")
+
+        return ClassSplit(ds=ds, count=count)
+
+    entries: list[ClassEntry] = []
+    for global_idx, class_name in enumerate(class_names):
+        entries.append(
+            ClassEntry(
+                name=class_name,
+                global_idx=global_idx,
+                train=_build_class_split("training", class_name),
+                val=_build_class_split("validation", class_name),
+                test=_build_class_split("testing", class_name),
+            )
+        )
+
+    return DatasetCatalog(class_names=class_names, entries=entries)
+
+
+# Backward-compat alias so old notebooks keep working unchanged.
+load_full_arrays = load_dataset_catalog
+
+
+def model_factory(
     name: str, input_repr: Literal["time", "mel"] = "time"
 ) -> Callable[[int], tf.keras.Model]:
-    if name == "cnn1d":
-        from building.time_models import TARGET_AUDIO_LEN, build_cnn1d
+    if input_repr == "time":
+        from building.time_models import get_time_model, TARGET_AUDIO_LEN
 
-        return lambda n_classes: build_cnn1d(
-            n_classes=n_classes, input_len=TARGET_AUDIO_LEN
-        )
-    if name == "cnn2d":
-        from building.mel_models import build_cnn2d
+        time_model = get_time_model(name)
+        return lambda n_classes: time_model(n_classes, TARGET_AUDIO_LEN)
+    elif input_repr == "mel":
+        from building.mel_models import get_mel_model
 
-        return lambda n_classes: build_cnn2d(n_classes=n_classes)
+        mel_model = get_mel_model(name)
+        return lambda n_classes: mel_model(n_classes)
     raise ValueError(f"Unknown model: {name}")
 
 
-def _build_dataset(
-    x: np.ndarray,
-    y: np.ndarray,
+def _subsample_dataset(
+    ds: tf.data.Dataset,
+    count: int,
+    n: int,
+    rng: np.random.Generator,
+) -> tf.data.Dataset:
+    """Pick n samples from ds (total: count) without loading everything into RAM.
+
+    Works by zipping a boolean mask dataset against the source and filtering —
+    so only the selected samples are ever materialised as tensors.
+    """
+    if count <= n:
+        return ds
+    chosen_mask = np.zeros(count, dtype=bool)
+    chosen_mask[rng.choice(count, size=n, replace=False)] = True
+    mask_ds = tf.data.Dataset.from_tensor_slices(chosen_mask)
+    return (
+        tf.data.Dataset.zip((ds, mask_ds))
+        .filter(lambda _x, m: m)  # ty:ignore[invalid-argument-type]
+        .map(lambda x, _m: x)
+    )
+
+
+def _build_dataset_from_catalog(
+    catalog: DatasetCatalog,
     chosen_idxs: list[int],
+    non_target_idx: int,
     batch_size: int,
     rng: np.random.Generator,
-    shuffle: bool,
-    non_target_idx: int | None = None,
+    split: Literal["train", "val", "test"],
 ) -> tuple[tf.data.Dataset, DatasetMeta]:
-    remaining = [i for i in np.unique(y).tolist() if i not in chosen_idxs]
-    if not remaining:
-        raise ValueError("No remaining classes for non-target sampling.")
+    """Build a batched TF dataset for one experiment from the on-disk catalog.
 
-    # Use the dedicated non_target class exclusively when available.
-    if non_target_idx is not None and non_target_idx in remaining:
-        non_target_pool = np.where(y == non_target_idx)[0]
-    else:
-        non_target_pool = np.where(np.isin(y, remaining))[0]
+    No numpy arrays are allocated; RAM usage is O(batch_size × sample_size).
+    """
+    all_idxs = chosen_idxs + [non_target_idx]
+    entries = [catalog.entries[i] for i in all_idxs]
 
-    counts = [len(np.where(y == c)[0]) for c in chosen_idxs]
-    if any(n == 0 for n in counts):
-        raise ValueError("A chosen class has no samples.")
+    def _get_split(e: ClassEntry) -> ClassSplit:
+        if split == "train":
+            return e.train
+        if split == "val":
+            return e.val
+        return e.test
 
-    n_each = min(counts)
-    if shuffle:
-        if len(non_target_pool) >= len(chosen_idxs):
-            n_each = min(n_each, len(non_target_pool) // len(chosen_idxs))
-        if n_each < 1:
-            raise ValueError("Cannot build balanced training set.")
-        n_non_target = min(n_each, len(non_target_pool))
-    else:
-        n_non_target = min(max(counts), len(non_target_pool))
+    class_splits = [_get_split(e) for e in entries]
+    counts = [cs.count for cs in class_splits]
+    if any(c == 0 for c in counts):
+        bad = [all_idxs[i] for i, c in enumerate(counts) if c == 0]
+        raise ValueError(f"Class(es) {bad} have no samples in split '{split}'")
 
-    non_target_sample = rng.choice(non_target_pool, size=n_non_target, replace=False)
-    non_target_label = len(chosen_idxs)
+    do_shuffle = split == "train"
+    n_each = min(counts) if do_shuffle else max(counts)
+    n_classes = len(all_idxs)
 
-    parts_x, parts_y = [], []
-    for local_label, c in enumerate(chosen_idxs):
-        idx = np.where(y == c)[0]
-        if shuffle and len(idx) > n_each:
-            idx = rng.choice(idx, size=n_each, replace=False)
-        parts_x.append(x[idx])
-        parts_y.append(np.full(len(idx), local_label, dtype=np.int32))
-    parts_x.append(x[non_target_sample])
-    parts_y.append(np.full(n_non_target, non_target_label, dtype=np.int32))
+    parts: list[tf.data.Dataset] = []
+    for local_label, (cs, count) in enumerate(zip(class_splits, counts)):
+        ds = cs.ds
+        if do_shuffle and count > n_each:
+            ds = _subsample_dataset(ds, count, n_each, rng)
+        lbl = tf.constant(local_label, dtype=tf.int32)
+        parts.append(ds.map(lambda x, label=lbl: (x, label)))
 
-    x_all = np.concatenate(parts_x)
-    y_all = np.concatenate(parts_y)
-    order = rng.permutation(len(x_all))
+    combined = parts[0]
+    for p in parts[1:]:
+        combined = combined.concatenate(p)
 
-    ds = tf.data.Dataset.from_tensor_slices((x_all[order], y_all[order]))
-    if shuffle:
-        ds = ds.shuffle(
-            min(len(x_all), SHUFFLE_BUFFER_CAP), seed=int(rng.integers(0, 2**31 - 1))
+    if do_shuffle:
+        combined = combined.shuffle(
+            min(n_each * n_classes, SHUFFLE_BUFFER_CAP),
+            seed=int(rng.integers(0, 2**31 - 1)),
+            reshuffle_each_iteration=True,
         )
-    ds = (
-        ds.batch(batch_size)
+
+    combined = (
+        combined.batch(batch_size)
         .map(
-            lambda xb, yb: (xb, tf.one_hot(yb, non_target_label + 1, dtype=tf.float32)),
+            lambda xb, yb: (xb, tf.one_hot(yb, n_classes, dtype=tf.float32)),
             num_parallel_calls=1,
         )
         .prefetch(1)
     )
-    return ds, DatasetMeta(
-        n_each=int(n_each),
-        n_non_target=int(n_non_target),
-        n_classes=non_target_label + 1,
-    )
+    return combined, DatasetMeta(n_each=int(n_each), n_classes=n_classes)
 
 
 def _collect_predictions(
@@ -307,7 +391,7 @@ def load_results(results_file: Path) -> list[RunResult]:
 
 
 def run_experiments(
-    arrays: DatasetArrays,
+    catalog: DatasetCatalog,
     config: ScalingRunConfig,
     n_samples: int = 3,
     k_values: Iterable[int] = range(2, 10),
@@ -316,15 +400,13 @@ def run_experiments(
     run_scaling: bool = True,
 ) -> list[RunResult]:
     rng = np.random.default_rng(config.seed)
-    model_builder = _model_factory(config.build_model, config.input_repr)
+    model_builder = model_factory(config.build_model, config.input_repr)
     config.models_dir.mkdir(parents=True, exist_ok=True)
     config.results_file.parent.mkdir(parents=True, exist_ok=True)
 
-    non_target_idx = (
-        arrays.class_names.index("non_target")
-        if "non_target" in arrays.class_names
-        else None
-    )
+    if "non_target" not in catalog.class_names:
+        raise ValueError("Dataset must contain a 'non_target' class.")
+    non_target_idx = catalog.class_names.index("non_target")
     existing = load_results(config.results_file)
     produced: list[RunResult] = []
 
@@ -343,36 +425,31 @@ def run_experiments(
     ) -> None:
         model = history = None
         try:
-            train_ds, meta = _build_dataset(
-                arrays.x_train,
-                arrays.y_train,
+            train_ds, meta = _build_dataset_from_catalog(
+                catalog,
                 chosen_idxs,
+                non_target_idx,
                 config.batch_size,
                 rng,
-                shuffle=True,
-                non_target_idx=non_target_idx,
+                split="train",
             )
-            val_ds, _ = _build_dataset(
-                arrays.x_val,
-                arrays.y_val,
+            val_ds, _ = _build_dataset_from_catalog(
+                catalog,
                 chosen_idxs,
+                non_target_idx,
                 config.batch_size,
                 rng,
-                shuffle=False,
-                non_target_idx=non_target_idx,
+                split="val",
             )
-            test_ds, _ = _build_dataset(
-                arrays.x_test,
-                arrays.y_test,
+            test_ds, _ = _build_dataset_from_catalog(
+                catalog,
                 chosen_idxs,
+                non_target_idx,
                 config.batch_size,
                 rng,
-                shuffle=False,
-                non_target_idx=non_target_idx,
+                split="test",
             )
-            print(
-                f"[{run_type}] n_each={meta.n_each} n_non_target={meta.n_non_target} n_classes={meta.n_classes}"
-            )
+            print(f"[{run_type}] n_each={meta.n_each} n_classes={meta.n_classes}")
 
             model = model_builder(meta.n_classes)
             history = model.fit(
@@ -422,7 +499,7 @@ def run_experiments(
 
     if run_baseline:
         species_classes = [
-            (i, n) for i, n in enumerate(arrays.class_names) if n != "non_target"
+            (i, n) for i, n in enumerate(catalog.class_names) if n != "non_target"
         ]
         for target_idx, target_name in species_classes:
             if is_done("baseline", target_class=target_name):
@@ -436,7 +513,7 @@ def run_experiments(
             )
 
     if run_scaling:
-        n_classes_total = len(arrays.class_names)
+        n_classes_total = len(catalog.class_names)
         for k in k_values:
             if k < 2 or k >= n_classes_total:
                 continue
@@ -446,7 +523,7 @@ def run_experiments(
                 chosen_idxs = rng.choice(
                     n_classes_total, size=k, replace=False
                 ).tolist()
-                chosen_names = [arrays.class_names[i] for i in chosen_idxs]
+                chosen_names = [catalog.class_names[i] for i in chosen_idxs]
                 print(f"[scaling] k={k} sample={sample_idx + 1}/{n_samples}")
                 fit_eval(
                     chosen_idxs,
@@ -462,6 +539,50 @@ def run_experiments(
                 )
 
     return produced
+
+
+def print_baselines(catalog: DatasetCatalog, results_file: Path) -> None:
+    try:
+        df = pd.read_json(results_file, lines=True)
+    except Exception as e:
+        print(f"Could not read results file: {e}")
+        return
+
+    baseline_df = df[df["run_type"] == "baseline"].copy()
+    class_names = list(catalog.class_names)
+
+    # Calculate the longest class name
+    max_cls_len = max((len(str(cls)) for cls in class_names), default=0)
+    col_width = max(max_cls_len + 2, 15)
+
+    header = f"{'Target Class':<{col_width}} | {'Precision':>9} | {'Recall':>9} | {'Epochs':>6} | {'Timestamp'}"
+    print(header)
+    print("-" * len(header))
+
+    for cls in class_names:
+        cls_str = f"'{cls}'"
+        matches = baseline_df[baseline_df["target_class"] == cls]
+
+        if matches.empty:
+            continue
+
+        row = matches.iloc[-1]
+        metrics = row["metrics"]
+
+        prec = metrics["precision_mean"]
+        prec_std = metrics["precision_std"]
+
+        rec = metrics["recall_mean"]
+        rec_std = metrics["recall_std"]
+
+        f1 = metrics["f1_mean"]
+        f1_std = metrics["f1_std"]
+
+        epochs = row["epochs_trained"]
+        timestamp = row["timestamp"]
+        print(
+            f"{cls_str:<{col_width}} | {prec:>9.4f} ± {prec_std:>9.4f} | {rec:>9.4f} ± {rec_std:>9.4f} | {epochs:>6.0f} | {timestamp!s}"
+        )
 
 
 def summarize_results(results_file: Path) -> tuple[BaselineSummary, pd.DataFrame]:

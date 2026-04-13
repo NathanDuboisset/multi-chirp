@@ -19,7 +19,8 @@ ROOT = pyrootutils.setup_root(
 RAW_DATASET_DIR = ROOT / "raw_dataset"
 SUBSAMPLES_DIR = RAW_DATASET_DIR / "subsamples"
 DATASETS_DIR = ROOT / "datasets"
-SPLIT = (0.7, 0.15, 0.15)
+SPLIT_NAMES = ("training", "validation", "testing")
+SPLIT_RATIOS = (0.7, 0.15, 0.15)
 
 
 def build_dataset(
@@ -27,13 +28,12 @@ def build_dataset(
     species_names: list[str],
     clips_per_species: int | None = None,
     max_class_size_training: int | None = None,
-    split: tuple[float, float, float] = SPLIT,
+    split: tuple[float, float, float] = SPLIT_RATIOS,
     subsamples_dir: Path | None = None,
 ) -> Path:
     sdir = subsamples_dir or (SUBSAMPLES_DIR / collection_name)
     dataset_root = DATASETS_DIR / collection_name
-    splits = ("training", "validation", "testing")
-    for s in splits:
+    for s in SPLIT_NAMES:
         (dataset_root / s).mkdir(parents=True, exist_ok=True)
 
     class_to_clips: dict[str, list[Path]] = {}
@@ -49,29 +49,44 @@ def build_dataset(
     )
     if non_target_clips:
         class_to_clips["non_target"] = non_target_clips
+    if clips_per_species:
+        class_to_clips["non_target"] = class_to_clips["non_target"][:clips_per_species]
+
+    min_class_size = min(len(clips) for clips in class_to_clips.values())
+    for i_class, clips in class_to_clips.items():
+        if len(clips) > min_class_size:
+            clips = clips[:min_class_size]
+            print(f"Truncated {i_class} to {min_class_size} clips")
 
     for folder, all_clips in class_to_clips.items():
+        print(f"Processing {folder} with {len(all_clips)} clips")
         rng = random.Random(42)
         shuffled = list(all_clips)
         rng.shuffle(shuffled)
         n = len(shuffled)
         n_train = int(n * split[0])
         n_val = int(n * split[1])
-        for subset, files in zip(
-            splits,
+        print(
+            f"Training: {n_train}, Validation: {n_val}, Testing: {n - n_train - n_val}"
+        )
+        for split_name, files in zip(
+            SPLIT_NAMES,
             [
                 shuffled[:n_train],
                 shuffled[n_train : n_train + n_val],
                 shuffled[n_train + n_val :],
             ],
         ):
-            if max_class_size_training is not None and subset == "training":
+            if max_class_size_training is not None and split_name == "training":
                 files = files[:max_class_size_training]
-            dest = dataset_root / subset / folder
+            dest = dataset_root / split_name / folder
             dest.mkdir(parents=True, exist_ok=True)
-            for f in files:
-                target = dest / f.name
+            n_copy = 0
+            for file_path in files:
+                target = dest / f"{split_name}_{n_copy}.wav"
                 if not target.exists():
-                    target.symlink_to(f.resolve())
+                    target.symlink_to(file_path.resolve())
+                n_copy += 1
+            print(f"Copied {n_copy} clips from {folder} to {split_name}")
 
     return dataset_root

@@ -8,12 +8,13 @@ multi-label classification, compiled with binary cross-entropy.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
     import keras
 else:
     import tensorflow as tf
+
     keras = tf.keras
 
 from keras import layers, Model
@@ -36,11 +37,15 @@ def _compile(model: Model) -> Model:
     )
     return model
 
+
 CONV_FILTER_SIZE = 3
 N_CHANNELS = 4
 HIDDEN_SIZE = 8
 
-def build_cnn2d(n_classes: int, input_shape: tuple[int, int, int] = MEL_INPUT_SHAPE) -> Model:
+
+def build_cnn2d(
+    n_classes: int, input_shape: tuple[int, int, int] = MEL_INPUT_SHAPE
+) -> Model:
     """Standard 2-D CNN on log-mel spectrogram."""
     inp = layers.Input(shape=input_shape, name="mel_spectrogram")
     x = layers.Conv2D(N_CHANNELS, (3, 3), activation="relu", padding="same")(inp)
@@ -49,7 +54,13 @@ def build_cnn2d(n_classes: int, input_shape: tuple[int, int, int] = MEL_INPUT_SH
     x = layers.MaxPooling2D((2, 2))(x)
     x = layers.Flatten()(x)
     x = layers.Dense(HIDDEN_SIZE, activation="relu")(x)
-    x = layers.Dropout(0.2)(x)
+    x = layers.Dropout(0.4)(x)
     out = layers.Dense(n_classes, activation="sigmoid", name="predictions")(x)
     return _compile(Model(inp, out, name="cnn2d_mel"))
 
+
+def get_mel_model(name: str) -> Callable[[int], Model]:
+    if name == "cnn2d":
+        return build_cnn2d
+    else:
+        raise ValueError(f"Unknown model: {name}")

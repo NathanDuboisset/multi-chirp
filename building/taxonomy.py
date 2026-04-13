@@ -34,7 +34,7 @@ RAW_DATASET_DIR = ROOT / "raw_dataset"
 TAXONOMY_CACHE = RAW_DATASET_DIR / "taxonomy_cache.csv"
 XC_API_BASE = "https://xeno-canto.org/api/3/recordings"
 
-MINIMUM_QUALITY: str = "A"
+MINIMUM_QUALITY: str = "B"
 
 XC_QUALITY_FILTER: dict[str, str] = {
     "A": "q:A",

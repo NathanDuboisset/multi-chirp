@@ -8,7 +8,7 @@ classification, compiled with binary cross-entropy.
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
     import keras
@@ -58,13 +58,13 @@ def build_cnn1d(n_classes: int, input_len: int = TARGET_AUDIO_LEN) -> Model:
     return _compile(Model(inp, out, name="cnn1d"), n_classes)
 
 
-SINCNET_NUM_FILTERS = 32
+SINCNET_NUM_FILTERS = 48
 SINCNET_DENSE_HIDDEN = 64
 SINCNET_KERNEL_SIZE = 32
-SINCNET_STRIDE = 64
+SINCNET_STRIDE = 8
 
 
-class CustomFrontend(layers.Layer):
+class SincLayer(layers.Layer):
     def __init__(self, num_filters: int, kernel_size: int, stride: int, **kwargs):
         super().__init__(**kwargs)
         self.num_filters = num_filters
@@ -89,7 +89,7 @@ class CustomFrontend(layers.Layer):
 def build_sincnet(n_classes: int, input_len: int = TARGET_AUDIO_LEN) -> Model:
     """SincNet-inspired model: learnable bandpass filters + 1-D CNN."""
     inp = layers.Input(shape=(input_len, 1), name="audio")
-    x = CustomFrontend(
+    x = SincLayer(
         num_filters=SINCNET_NUM_FILTERS,
         kernel_size=SINCNET_KERNEL_SIZE,
         stride=SINCNET_STRIDE,
@@ -195,3 +195,14 @@ def build_leaf(n_classes: int, input_len: int = TARGET_AUDIO_LEN) -> Model:
     x = layers.Dense(64, activation="relu")(x)
     outputs = layers.Dense(n_classes, activation="sigmoid", name="predictions")(x)
     return _compile(Model(inputs, outputs, name="leaf"), n_classes)
+
+
+def get_time_model(name: str) -> Callable[[int, int], Model]:
+    if name == "cnn1d":
+        return build_cnn1d
+    elif name == "sincnet":
+        return build_sincnet
+    elif name == "leaf":
+        return build_leaf
+    else:
+        raise ValueError(f"Unknown model: {name}")

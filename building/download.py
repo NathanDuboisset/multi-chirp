@@ -126,8 +126,9 @@ def _append_processed(
     csv_path: Path, filename: str, clips: int, lock: threading.Lock
 ) -> None:
     with lock:
-        write_header = not csv_path.exists()
         csv_path.parent.mkdir(parents=True, exist_ok=True)
+        write_header = not csv_path.exists()
+
         if not csv_path.exists():
             csv_path.touch()
         with csv_path.open("a", newline="", encoding="utf-8") as f:
@@ -142,6 +143,7 @@ def _process_recording(
     collection_name: str,
     clips_per_species: int,
     auto_delete: bool,
+    clip_counts: dict[str, int],
     lock: threading.Lock,
     nt_other_lock: threading.Lock,
     nt_empty_lock: threading.Lock,
@@ -156,13 +158,18 @@ def _process_recording(
     nt_empty_out.mkdir(parents=True, exist_ok=True)
     processed_csv = LISTINGS_DIR / f"processed/{task.species_key}.csv"
 
+    # Re-check cap at runtime so stale queued jobs do not download/process.
+    with lock:
+        if clip_counts[task.species_key] >= clips_per_species:
+            return 0
+
     try:
-        with requests.get(task.file_url, timeout=60, stream=True) as r:
-            r.raise_for_status()
-            with audio_path.open("wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
+        with requests.get(task.file_url, timeout=60, stream=True) as dl_request:
+            dl_request.raise_for_status()
+            with audio_path.open("wb") as audiofile:
+                for chunk in dl_request.iter_content(chunk_size=8192):
                     if chunk:
-                        f.write(chunk)
+                        audiofile.write(chunk)
     except Exception as e:
         print(f"[{task.scientific_name}] download failed {task.filename}: {e}")
         return 0
@@ -205,19 +212,24 @@ def _process_recording(
             return _clip_indices[key]
 
         with lock:
-            current = _clip_indices.get(f"{collection_name}/{task.species_key}", None)
-            if current is None:
-                current = _get_idx(f"{collection_name}/{task.species_key}", species_out)
+            clip_key = f"{collection_name}/{task.species_key}"
+            if clip_key not in _clip_indices:
+                _clip_indices[clip_key] = clip_counts[task.species_key]
             for det in target_dets:
-                if current + clips_written >= clips_per_species:
+                if clip_counts[task.species_key] >= clips_per_species:
                     break
-                idx = _clip_indices[f"{collection_name}/{task.species_key}"]
+                idx = _clip_indices[clip_key]
                 if _write_clip(
                     audio_path,
                     float(det.get("start_time", 0.0)),
                     species_out / f"clip_{idx:05d}.wav",
                 ):
-                    _clip_indices[f"{collection_name}/{task.species_key}"] += 1
+                    _clip_indices[clip_key] += 1
+                    clip_counts[task.species_key] += 1
+                    if clip_counts[task.species_key] == clips_per_species:
+                        print(
+                            f"[{task.scientific_name}] {clips_per_species} clips written for {task.species_key}"
+                        )
                     clips_written += 1
 
         if other_dets:
@@ -254,7 +266,7 @@ def _process_recording(
 
     except Exception as e:
         print(f"[{task.scientific_name}] BirdNET failed {task.filename}: {e}")
-    finally:
+    else:
         _append_processed(processed_csv, task.filename, clips_written, lock)
         if auto_delete:
             audio_path.unlink(missing_ok=True)
@@ -262,7 +274,7 @@ def _process_recording(
 
 
 async def _fetch_listing(
-    session: aiohttp.ClientSession, scientific_name: str, max_recordings: int
+    session: aiohttp.ClientSession, scientific_name: str
 ) -> list[dict[str, str]]:
     species_key = scientific_name.replace(" ", "_")
     listing_path = LISTINGS_DIR / f"available/{species_key}.csv"
@@ -273,7 +285,7 @@ async def _fetch_listing(
     rows: list[dict[str, str]] = []
     page = 1
     key = os.getenv("XC_API_KEY", "demo")
-    while len(rows) < max_recordings:
+    while True:
         async with session.get(
             XC_API_BASE,
             params={"query": query, "key": key, "per_page": 100, "page": page},
@@ -294,8 +306,6 @@ async def _fetch_listing(
                     "quality": str(rec.get("q", "")).strip(),
                 }
             )
-            if len(rows) >= max_recordings:
-                break
         if page >= int(data.get("numPages", 1)) or not data.get("recordings"):
             break
         page += 1
@@ -312,7 +322,6 @@ async def download_and_process(
     species_names: list[str],
     collection_name: str,
     clips_per_species: int,
-    max_recordings: int = 500,
     auto_delete: bool = False,
 ) -> None:
     LISTINGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -323,11 +332,17 @@ async def download_and_process(
     ) as session:
         print("Fetching available listings...")
         listings = await asyncio.gather(
-            *[_fetch_listing(session, name, max_recordings) for name in species_names]
+            *[_fetch_listing(session, name) for name in species_names]
         )
 
     excluded = frozenset(n.lower() for n in species_names)
     locks = {name.replace(" ", "_"): threading.Lock() for name in species_names}
+    clip_counts = {
+        name.replace(" ", "_"): _count_clips(collection_name, name.replace(" ", "_"))
+        for name in species_names
+    }
+    for species_key, count in clip_counts.items():
+        _clip_indices[f"{collection_name}/{species_key}"] = count
     nt_other_lock = threading.Lock()
     nt_empty_lock = threading.Lock()
 
@@ -339,10 +354,14 @@ async def download_and_process(
             for r in _read_csv(LISTINGS_DIR / f"processed/{species_key}.csv")
             if r.get("recording")
         }
-        already = _count_clips(collection_name, species_key)
+        already = clip_counts[species_key]
         if already >= clips_per_species:
             print(f"[{scientific_name}] {already} clips, skipping.")
             continue
+        else:
+            print(
+                f"[{scientific_name}] {already} clips, downloading {clips_per_species - already} more."
+            )
         pending = [r for r in available if r["filename"] not in processed]
         random.shuffle(pending)
         pending = pending[: clips_per_species - already]
@@ -383,6 +402,7 @@ async def download_and_process(
                 collection_name,
                 clips_per_species,
                 auto_delete,
+                clip_counts,
                 locks[task.species_key],
                 nt_other_lock,
                 nt_empty_lock,
