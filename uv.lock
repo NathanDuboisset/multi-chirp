@@ -219,6 +219,20 @@ wheels = [
 ]
 
 [[package]]
+name = "audioset-download"
+version = "1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "joblib" },
+    { name = "pandas" },
+    { name = "yt-dlp" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/dc/3e/6a43d19eb385755fe721608fbedb6f89f7d18f775a88b4e9f400d32906ab/audioset_download-1.1.tar.gz", hash = "sha256:cdaf680cc614f59b12b670626637119c148f43eea2316431859acd71efd93330", size = 6639, upload-time = "2025-07-06T13:17:18.628Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8f/4e/03f63cf94cfc6c46c5411f2ca31edd23cd2b8b6be580ea448f71f3861fa5/audioset_download-1.1-py3-none-any.whl", hash = "sha256:0aefcf58565e39651a2e5a9a44ae21f8917efee5e6f449f04c5d2ada65a20534", size = 6637, upload-time = "2025-07-06T13:17:17.309Z" },
+]
+
+[[package]]
 name = "babel"
 version = "2.18.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2681,6 +2695,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
+    { name = "audioset-download" },
     { name = "birdnetlib" },
     { name = "ipykernel" },
     { name = "jupyter" },
@@ -2700,11 +2715,13 @@ dependencies = [
     { name = "tensorflow-io", extra = ["tensorflow"] },
     { name = "tqdm" },
     { name = "types-tensorflow" },
+    { name = "yt-dlp" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.10" },
+    { name = "audioset-download", specifier = ">=1.1" },
     { name = "birdnetlib", specifier = ">=0.9" },
     { name = "ipykernel" },
     { name = "jupyter" },
@@ -2724,6 +2741,7 @@ requires-dist = [
     { name = "tensorflow-io", extras = ["tensorflow"], specifier = ">=0.37.1" },
     { name = "tqdm", specifier = ">=4.67.3" },
     { name = "types-tensorflow", specifier = ">=2.18.0.20260402" },
+    { name = "yt-dlp", specifier = ">=2025.1" },
 ]
 
 [[package]]
@@ -3025,4 +3043,13 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/f5/be/25216a49daeeb7af2bec0db22d5e7df08ed1d7c9f65d78b14f3b74fd72fc/yarl-1.23.0-cp312-cp312-win_amd64.whl", hash = "sha256:f69f57305656a4852f2a7203efc661d8c042e6cc67f7acd97d8667fb448a426e", size = 87674, upload-time = "2026-03-01T22:05:38.171Z" },
     { url = "https://files.pythonhosted.org/packages/d2/35/aeab955d6c425b227d5b7247eafb24f2653fedc32f95373a001af5dfeb9e/yarl-1.23.0-cp312-cp312-win_arm64.whl", hash = "sha256:6e87a6e8735b44816e7db0b2fbc9686932df473c826b0d9743148432e10bb9b9", size = 81879, upload-time = "2026-03-01T22:05:40.006Z" },
     { url = "https://files.pythonhosted.org/packages/69/68/c8739671f5699c7dc470580a4f821ef37c32c4cb0b047ce223a7f115757f/yarl-1.23.0-py3-none-any.whl", hash = "sha256:a2df6afe50dea8ae15fa34c9f824a3ee958d785fd5d089063d960bae1daa0a3f", size = 48288, upload-time = "2026-03-01T22:07:51.388Z" },
+]
+
+[[package]]
+name = "yt-dlp"
+version = "2026.3.17"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/8b/34/7c6b4e3f89cb6416d2cd7ab6dab141a1df97ab0fb22d15816db2c92148c9/yt_dlp-2026.3.17.tar.gz", hash = "sha256:ba7aa31d533f1ffccfe70e421596d7ca8ff0bf1398dc6bb658b7d9dec057d2c9", size = 3119221, upload-time = "2026-03-17T23:43:00.244Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cd/13/5093bcb954878e50f7217fd2ab94282b53934022e4e4a03265582da83bf5/yt_dlp-2026.3.17-py3-none-any.whl", hash = "sha256:32992db94303a8a5d211a183f2174834fe7f8c29d83ed2e7a324eae97a8f26d8", size = 3315134, upload-time = "2026-03-17T23:42:57.863Z" },
 ]

@@ -9,6 +9,7 @@ import contextlib
 import csv
 import os
 import random
+import shutil
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -112,7 +113,7 @@ def _write_clip(audio_file: Path, start: float, clip_path: Path) -> bool:
 
 def _count_clips(collection_name: str, species_key: str) -> int:
     d = SUBSAMPLES_DIR / collection_name / species_key
-    return sum(1 for _ in d.glob("clip_*.wav")) if d.exists() else 0
+    return sum(1 for _ in d.glob("*.wav")) if d.exists() else 0
 
 
 def _read_csv(csv_path: Path) -> list[dict[str, str]]:
@@ -150,6 +151,7 @@ def _process_recording(
 ) -> int:
     (SPECIES_DIR / task.species_key).mkdir(parents=True, exist_ok=True)
     audio_path = SPECIES_DIR / task.species_key / task.filename
+    xc_id = task.filename.removeprefix("XC").rsplit(".", 1)[0]
     species_out = SUBSAMPLES_DIR / collection_name / task.species_key
     species_out.mkdir(parents=True, exist_ok=True)
     nt_other_out = SUBSAMPLES_DIR / collection_name / "non_target_other"
@@ -202,8 +204,9 @@ def _process_recording(
                 _clip_indices[key] = (
                     max(
                         (
-                            int(p.stem.split("_", 1)[1])
-                            for p in directory.glob("clip_*.wav")
+                            int(p.stem.rsplit("_", 1)[1])
+                            for p in directory.glob("*.wav")
+                            if p.stem.rsplit("_", 1)[-1].isdigit()
                         ),
                         default=-1,
                     )
@@ -222,7 +225,7 @@ def _process_recording(
                 if _write_clip(
                     audio_path,
                     float(det.get("start_time", 0.0)),
-                    species_out / f"clip_{idx:05d}.wav",
+                    species_out / f"XC{xc_id}_{idx:05d}.wav",
                 ):
                     _clip_indices[clip_key] += 1
                     clip_counts[task.species_key] += 1
@@ -242,7 +245,7 @@ def _process_recording(
                     if _write_clip(
                         audio_path,
                         float(det.get("start_time", 0.0)),
-                        nt_other_out / f"clip_{_clip_indices[nt_key]:05d}.wav",
+                        nt_other_out / f"XC{xc_id}_{_clip_indices[nt_key]:05d}.wav",
                     ):
                         _clip_indices[nt_key] += 1
 
@@ -260,7 +263,7 @@ def _process_recording(
                     if _write_clip(
                         audio_path,
                         start,
-                        nt_empty_out / f"clip_{_clip_indices[nt_key]:05d}.wav",
+                        nt_empty_out / f"XC{xc_id}_{_clip_indices[nt_key]:05d}.wav",
                     ):
                         _clip_indices[nt_key] += 1
 
@@ -318,12 +321,22 @@ async def _fetch_listing(
     return rows
 
 
+def _require_ffmpeg() -> None:
+    """librosa decodes XC mp3s through audioread→ffmpeg; fail fast if missing."""
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError(
+            "ffmpeg not found on PATH. Install it (Ubuntu: `sudo apt install ffmpeg`) "
+            "before running the Xeno-Canto download pipeline."
+        )
+
+
 async def download_and_process(
     species_names: list[str],
     collection_name: str,
     clips_per_species: int,
     auto_delete: bool = False,
 ) -> None:
+    _require_ffmpeg()
     LISTINGS_DIR.mkdir(parents=True, exist_ok=True)
     (SUBSAMPLES_DIR / collection_name).mkdir(parents=True, exist_ok=True)
 

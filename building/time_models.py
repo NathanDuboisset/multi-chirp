@@ -10,6 +10,8 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING, Callable
 
+import numpy as np
+
 if TYPE_CHECKING:
     import keras
     import tensorflow as tf
@@ -22,6 +24,7 @@ from keras import layers, Model
 
 # Matches utils.py constants (16 kHz, 184 frames)
 TARGET_AUDIO_LEN = 47_872  # (184 - 1) * 256 + 1024  — same as utils.SAMPLE_RATE
+SAMPLE_RATE = 16_000
 
 
 def _compile(model: Model, n_classes: int) -> Model:
@@ -58,46 +61,184 @@ def build_cnn1d(n_classes: int, input_len: int = TARGET_AUDIO_LEN) -> Model:
     return _compile(Model(inp, out, name="cnn1d"), n_classes)
 
 
-SINCNET_NUM_FILTERS = 48
+SINCNET_NUM_FILTERS = 32
+SINCNET_KERNEL_SIZE = 64
+SINCNET_STRIDE = 16
+SINCNET_CONV_FILTERS = 16
+SINCNET_CONV_FILTER_SIZE = 8
+SINCNET_CONV_STRIDE = 2
 SINCNET_DENSE_HIDDEN = 64
-SINCNET_KERNEL_SIZE = 32
-SINCNET_STRIDE = 8
 
 
-class SincLayer(layers.Layer):
-    def __init__(self, num_filters: int, kernel_size: int, stride: int, **kwargs):
+class SincnetConv(layers.Layer):
+    """SincNet-style learnable bandpass filterbank on rank-4 NHWC audio.
+
+    Filters are parameterized by low cutoff (f1) and bandwidth, initialized on
+    the mel scale, then composed as the difference of two sincs and multiplied
+    by a Hamming window. Time runs along the spatial height axis so the graph
+    stays microflow-compatible after baking.
+    """
+
+    def __init__(
+        self,
+        num_filters: int,
+        kernel_size: int,
+        stride: int,
+        sample_rate: int = SAMPLE_RATE,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self.num_filters = num_filters
-        self.kernel_size = kernel_size
         self.stride = stride
-        self.params = self.add_weight(
-            shape=(kernel_size, 1, num_filters),
-            initializer="random_normal",
+        self.sample_rate = sample_rate
+        self.kernel_size = kernel_size if kernel_size % 2 != 0 else kernel_size + 1
+
+    def build(self, _input_shape):
+        mel_min = 0.0
+        mel_max = self._hz_to_mel(self.sample_rate / 2.0)
+        mel_points = np.linspace(mel_min, mel_max, self.num_filters + 1)
+        hz_points = self._mel_to_hz(mel_points)
+        f1_init = hz_points[:-1] / self.sample_rate
+        band_init = np.diff(hz_points) / self.sample_rate
+
+        self.f1 = self.add_weight(
+            name="f1",
+            shape=(self.num_filters,),
+            initializer=tf.keras.initializers.Constant(f1_init),
             trainable=True,
-            name="sinc_params",
         )
+        self.band = self.add_weight(
+            name="band",
+            shape=(self.num_filters,),
+            initializer=tf.keras.initializers.Constant(band_init),
+            trainable=True,
+        )
+        t = np.linspace(
+            -(self.kernel_size // 2), self.kernel_size // 2, self.kernel_size
+        )
+        self.t = tf.constant(t, dtype=tf.float32)
+        window = 0.54 - 0.46 * np.cos(
+            2 * math.pi * np.arange(self.kernel_size) / (self.kernel_size - 1)
+        )
+        self.window = tf.constant(window, dtype=tf.float32)
 
     def get_filters(self) -> tf.Tensor:
-        return tf.math.sin(self.params)
+        f1_safe = tf.math.abs(self.f1)
+        f2_safe = f1_safe + tf.math.abs(self.band)
+
+        f1_mat = tf.reshape(f1_safe, (1, -1))
+        f2_mat = tf.reshape(f2_safe, (1, -1))
+        t_mat = tf.reshape(self.t, (-1, 1))
+
+        pi_t = math.pi * t_mat
+        denom = tf.where(t_mat == 0.0, 1.0, pi_t)
+        filters = (
+            tf.math.sin(2.0 * math.pi * f2_mat * t_mat)
+            - tf.math.sin(2.0 * math.pi * f1_mat * t_mat)
+        ) / denom
+
+        center_values = 2.0 * (f2_mat - f1_mat)
+        mask = tf.cast(t_mat == 0.0, tf.float32)
+        filters = filters * (1.0 - mask) + center_values * mask
+
+        filters = filters * tf.reshape(self.window, (-1, 1))
+        return tf.reshape(filters, (self.kernel_size, 1, self.num_filters))
+
+    def get_filters_nhwc(self) -> tf.Tensor:
+        return tf.reshape(
+            self.get_filters(), (self.kernel_size, 1, 1, self.num_filters)
+        )
 
     def call(self, inputs: tf.Tensor) -> tf.Tensor:
-        return tf.nn.conv1d(
-            inputs, self.get_filters(), stride=self.stride, padding="VALID"
+        return tf.nn.conv2d(
+            inputs,
+            self.get_filters_nhwc(),
+            strides=[1, self.stride, 1, 1],
+            padding="VALID",
+            data_format="NHWC",
         )
+
+    def export_to_conv2d(self, name: str = "baked_sinc_conv") -> layers.Conv2D:
+        """Bake learned Sinc filters into a static Conv2D for TFLite / microflow."""
+        baked = self.get_filters().numpy()
+        w = np.reshape(baked, (self.kernel_size, 1, 1, self.num_filters))
+        conv_layer = layers.Conv2D(
+            filters=self.num_filters,
+            kernel_size=(self.kernel_size, 1),
+            strides=(self.stride, 1),
+            padding="valid",
+            use_bias=False,
+            name=name,
+        )
+        conv_layer.build(input_shape=(None, None, 1, 1))
+        conv_layer.set_weights([w])
+        return conv_layer
+
+    def get_config(self):
+        config = super().get_config()
+        config.update(
+            {
+                "num_filters": self.num_filters,
+                "kernel_size": self.kernel_size,
+                "stride": self.stride,
+                "sample_rate": self.sample_rate,
+            }
+        )
+        return config
+
+    @staticmethod
+    def _hz_to_mel(hz):
+        return 2595.0 * np.log10(1.0 + hz / 700.0)
+
+    @staticmethod
+    def _mel_to_hz(mel):
+        return 700.0 * (10.0 ** (mel / 2595.0) - 1.0)
 
 
 def build_sincnet(n_classes: int, input_len: int = TARGET_AUDIO_LEN) -> Model:
-    """SincNet-inspired model: learnable bandpass filters + 1-D CNN."""
+    """Multi-layer SincNet: learnable bandpass frontend + 2 temporal Conv2D blocks.
+
+    Input is the project-standard [batch, time, 1]; reshaped internally to
+    rank-4 NHWC (time = height) so Conv2D / AveragePooling2D map to ops
+    supported by microflow.
+    """
     inp = layers.Input(shape=(input_len, 1), name="audio")
-    x = SincLayer(
+    x = layers.Reshape((input_len, 1, 1), name="to_nhwc")(inp)
+
+    x = SincnetConv(
         num_filters=SINCNET_NUM_FILTERS,
         kernel_size=SINCNET_KERNEL_SIZE,
         stride=SINCNET_STRIDE,
-        name="sinc_frontend",
-    )(inp)
+        sample_rate=SAMPLE_RATE,
+        name="sincnet_convolution",
+    )(x)
     x = layers.ReLU()(x)
-    x = layers.GlobalAveragePooling1D()(x)
-    x = layers.Dense(SINCNET_DENSE_HIDDEN, activation="relu")(x)
+    x = layers.AveragePooling2D(pool_size=(4, 1), name="envelope_pool")(x)
+
+    x = layers.Conv2D(
+        filters=SINCNET_CONV_FILTERS,
+        kernel_size=(SINCNET_CONV_FILTER_SIZE, 1),
+        strides=(SINCNET_CONV_STRIDE, 1),
+        padding="same",
+        name="temporal_conv_1",
+    )(x)
+    x = layers.ReLU()(x)
+    x = layers.AveragePooling2D(pool_size=(4, 1), name="temporal_pool_1")(x)
+
+    x = layers.Conv2D(
+        filters=SINCNET_CONV_FILTERS,
+        kernel_size=(SINCNET_CONV_FILTER_SIZE, 1),
+        strides=(SINCNET_CONV_STRIDE, 1),
+        padding="same",
+        name="temporal_conv_2",
+    )(x)
+    x = layers.ReLU()(x)
+
+    x = layers.AveragePooling2D(
+        pool_size=(x.shape[1], 1), padding="valid", name="final_pool"
+    )(x)
+    x = layers.Flatten(name="flatten")(x)
+    x = layers.Dense(SINCNET_DENSE_HIDDEN, activation="relu", name="dense_hidden")(x)
     out = layers.Dense(n_classes, activation="sigmoid", name="predictions")(x)
     return _compile(Model(inp, out, name="sincnet"), n_classes)
 

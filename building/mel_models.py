@@ -39,8 +39,8 @@ def _compile(model: Model) -> Model:
 
 
 CONV_FILTER_SIZE = 3
-N_CHANNELS = 4
-HIDDEN_SIZE = 8
+N_CHANNELS = 16
+HIDDEN_SIZE = 64
 
 
 def build_cnn2d(
@@ -48,19 +48,20 @@ def build_cnn2d(
 ) -> Model:
     """Standard 2-D CNN on log-mel spectrogram."""
     inp = layers.Input(shape=input_shape, name="mel_spectrogram")
-    x = layers.Conv2D(N_CHANNELS, (3, 3), activation="relu", padding="same")(inp)
+    x = layers.BatchNormalization(name="input_norm")(inp)
+    x = layers.Conv2D(N_CHANNELS, (3, 3), activation="relu", padding="same")(x)
     x = layers.MaxPooling2D((2, 2))(x)
     x = layers.Conv2D(N_CHANNELS, (3, 3), activation="relu", padding="same")(x)
     x = layers.MaxPooling2D((2, 2))(x)
     x = layers.Flatten()(x)
     x = layers.Dense(HIDDEN_SIZE, activation="relu")(x)
-    x = layers.Dropout(0.4)(x)
+    x = layers.Dropout(0.2)(x)
     out = layers.Dense(n_classes, activation="sigmoid", name="predictions")(x)
     return _compile(Model(inp, out, name="cnn2d_mel"))
 
 
 def get_mel_model(name: str) -> Callable[[int], Model]:
-    if name == "cnn2d":
+    if name == "mel_cnn":
         return build_cnn2d
     else:
         raise ValueError(f"Unknown model: {name}")

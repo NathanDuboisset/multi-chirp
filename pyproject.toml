@@ -23,6 +23,8 @@ dependencies = [
   "pyrootutils>=1.0",
   "types-tensorflow>=2.18.0.20260402",
   "resampy>=0.4.3",
+  "audioset-download>=1.1",
+  "yt-dlp>=2025.1",
 ]
 
 [build-system]
