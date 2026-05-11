@@ -19,3 +19,4 @@ src/audio_sample.rs
 raw_dataset/
 models/
 .cache/
+notebooks_thesis/

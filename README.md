@@ -76,6 +76,6 @@ echo "XC_API_KEY=your_key_here" > ../.env
        testing/<Species>/
    ```
 
-4. **Train** — use `time_models.py` (CNN-1D, SincNet, BiLSTM) or `mel_models.py` (CNN-2D, MobileNetV2, CRNN). All models take `n_classes` as argument and output sigmoid probabilities.
+4. **Train** — `scaling.ipynb` drives baseline + scaling experiments. Pick any model from `building.models.available_models()` (`cnn1d`, `sincnet`, `leaf`, `mel_cnn`); the input representation (raw waveform vs log-mel) is inferred from the registry in `building/models/__init__.py`. Each model file exposes a `build(n_classes, …) -> keras.Model` returning a compiled sigmoid head.
 
-5. **Evaluate** — `evaluate.py` provides `evaluate_multiclass()` with per-class AUC, confusion matrix, and classification report.
+5. **Evaluate** — `scaling.run_experiments()` writes per-run metrics to `results.jsonl`; `summarize_results()` + `plot_summary()` produce the macro precision/recall/F1/top-1 curves over k.

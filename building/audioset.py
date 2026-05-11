@@ -1,14 +1,17 @@
 """
 audioset.py — fetch ambient `non_target` audio from Google's AudioSet.
 
-Pipeline:
-    1. download_audioset_focus_classes(cfg) → raw 10 s clips per class
-    2. postprocess_audioset_clips(cfg)      → 16 kHz mono, 3.0 s WAV
-    3. materialize_audioset_non_target(cfg, collection) → symlinks under
-       raw_dataset/subsamples/<collection>/non_target_audioset/
+Uses the Hugging Face `agkphysics/AudioSet` mirror in streaming mode so we
+never download more than we need and never touch YouTube directly.
 
-Designed to plug into the existing XC pipeline in building/download.py and
-the symlink-based assembly in building/dataset.py.
+Pipeline:
+    1. stream_download_audioset(cfg) → iterate the chosen HF split with
+       streaming=True, keep only clips whose `human_labels` intersect
+       FOCUS_CLASSES, pick the loudest CLIP_DURATION window inside the
+       ~10 s example (by RMS), and write a 16 kHz mono WAV per clip.
+       Stops once per-class cap or global cap is reached.
+    2. materialize_audioset_non_target(cfg, collection) → symlinks under
+       raw_dataset/subsamples/<collection>/non_target_audioset/.
 """
 
 from __future__ import annotations
@@ -18,10 +21,10 @@ import re
 from pathlib import Path
 from typing import Literal
 
-import librosa
 import numpy as np
 import pyrootutils
 import soundfile as sf
+from datasets import Audio, load_dataset
 from pydantic import BaseModel, ConfigDict
 from tqdm import tqdm
 
@@ -30,8 +33,6 @@ from building.download import (
     RAW_DATASET_DIR,
     SUBSAMPLES_DIR,
     TARGET_SAMPLE_RATE,
-    _require_ffmpeg,
-    quiet,
 )
 
 ROOT = pyrootutils.setup_root(
@@ -79,203 +80,164 @@ def _slugify(name: str) -> str:
 class AudioSetConfig(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    download_type: Literal["balanced_train", "unbalanced_train", "eval"] = (
-        "unbalanced_train"
-    )
-    # YouTube starts rate-limiting / bot-flagging above ~4 parallel jobs.
-    # Higher concurrency does not actually go faster end-to-end.
-    n_jobs: int = 4
-    clips_per_class: int = 400
+    # HF dataset config + split. `unbalanced/train` is the only realistic
+    # source if you want a few thousand clips spread across niche classes;
+    # `balanced` only has ~50 per class.
+    hf_config: Literal["balanced", "unbalanced", "full"] = "unbalanced"
+    hf_split: Literal["train", "test"] = "train"
+
+    clips_per_class: int = 250
+    max_total_clips: int = 5000
     target_sample_rate: int = TARGET_SAMPLE_RATE
     target_clip_duration: float = CLIP_DURATION
-    raw_dir: Path = RAW_DATASET_DIR / "audioset_raw"
     processed_dir: Path = RAW_DATASET_DIR / "audioset"
-    download_format: str = "wav"
+
+    # Sliding-window picker tuning.
+    window_hop_s: float = 0.5
+    # Reject clips whose loudest window is below this RMS — they're silent.
+    min_rms: float = 5e-3
 
 
-def _class_subdir(parent: Path, class_name: str) -> Path:
-    """audioset-download writes one folder per label; the folder name varies
-    slightly across versions (display name vs slug). Find the one that matches."""
-    candidates = [class_name, _slugify(class_name), class_name.replace(" ", "_")]
-    for cand in candidates:
-        p = parent / cand
-        if p.exists():
-            return p
-    return parent / class_name
-
-
-def _count_raw(class_dir: Path) -> int:
-    if not class_dir.exists():
-        return 0
-    return sum(
-        1
-        for p in class_dir.iterdir()
-        if p.is_file() and p.suffix.lower() in {".wav", ".ogg", ".flac", ".mp3", ".m4a"}
-    )
-
-
-_AUDIOSET_ONTOLOGY_URL = (
-    "http://storage.googleapis.com/us_audioset/youtube_corpus/v1/csv/"
-    "class_labels_indices.csv"
-)
-
-
-def _valid_audioset_labels() -> set[str]:
-    """Fetch AudioSet's official class_labels_indices.csv (cached locally)
-    and return the set of valid display_name values."""
-    import csv
-
-    import requests
-
-    cache = RAW_DATASET_DIR / "class_labels_indices.csv"
-    if not cache.exists():
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        resp = requests.get(_AUDIOSET_ONTOLOGY_URL, timeout=30)
-        resp.raise_for_status()
-        cache.write_bytes(resp.content)
-
-    with cache.open("r", encoding="utf-8") as f:
-        return {row["display_name"] for row in csv.DictReader(f)}
-
-
-async def download_audioset_focus_classes(
-    cfg: AudioSetConfig,
-) -> dict[str, int]:
-    """Download AudioSet clips for every class in FOCUS_CLASSES.
-
-    Idempotent: classes that already have >= cfg.clips_per_class raw files are
-    skipped. Returns {class_name: n_raw_files} after the run.
-    """
-    _require_ffmpeg()
-    cfg.raw_dir.mkdir(parents=True, exist_ok=True)
-
-    valid = _valid_audioset_labels()
-    unknown = [c for c in FOCUS_CLASSES if c not in valid]
-    if unknown:
-        print(
-            f"[audioset] WARNING: dropping {len(unknown)} class(es) not in "
-            f"AudioSet ontology: {unknown}"
-        )
-    usable = [c for c in FOCUS_CLASSES if c in valid]
-
-    pending: list[str] = []
-    for cls in usable:
-        n = _count_raw(_class_subdir(cfg.raw_dir, cls))
-        if n >= cfg.clips_per_class:
-            print(f"[audioset] {cls}: {n} clips, skipping.")
-        else:
-            pending.append(cls)
-
-    if not pending:
-        print("[audioset] all focus classes already populated.")
-    else:
-        print(f"[audioset] downloading {len(pending)} classes: {pending}")
-
-        def _do_download() -> None:
-            from audioset_download import Downloader
-
-            d = Downloader(
-                root_path=str(cfg.raw_dir),
-                labels=pending,
-                n_jobs=cfg.n_jobs,
-                download_type=cfg.download_type,
-            )
-            with quiet():
-                d.download(format=cfg.download_format)
-
-        await asyncio.to_thread(_do_download)
-
-    counts: dict[str, int] = {}
-    for cls in usable:
-        counts[cls] = _count_raw(_class_subdir(cfg.raw_dir, cls))
-        if counts[cls] == 0:
-            print(f"[audioset] WARNING: {cls!r} returned 0 clips.")
-    return counts
-
-
-def _resample_centre_clip(
-    src: Path, target_sr: int, target_dur: float
+def _loudest_window(
+    audio: np.ndarray, sr: int, dur: float, hop_s: float, min_rms: float
 ) -> np.ndarray | None:
-    """Load src, resample to target_sr mono, take centre target_dur seconds.
-    Returns None if the audio is unreadable or shorter than ~1 s."""
-    try:
-        with quiet():
-            audio, _ = librosa.load(
-                str(src), sr=target_sr, mono=True, res_type="kaiser_fast"
-            )
-    except Exception as e:
-        print(f"[audioset] skip unreadable {src.name}: {e}")
+    """Slide a `dur`-second window over `audio` and return the slice with
+    the highest RMS. Pads (centred) if the input is shorter than `dur`.
+    Returns None if even the best window is essentially silent.
+    """
+    n = int(dur * sr)
+    if len(audio) < sr:
         return None
 
-    target_len = int(target_dur * target_sr)
-    if len(audio) < target_sr:  # < 1 s of audio is junk
+    if len(audio) <= n:
+        pad = n - len(audio)
+        left = pad // 2
+        padded = np.pad(audio, (left, pad - left)).astype(np.float32)
+        if float(np.sqrt(np.mean(padded**2))) < min_rms:
+            return None
+        return padded
+
+    hop = max(1, int(hop_s * sr))
+    best_start, best_rms = 0, -1.0
+    for start in range(0, len(audio) - n + 1, hop):
+        rms = float(np.sqrt(np.mean(audio[start : start + n] ** 2)))
+        if rms > best_rms:
+            best_rms = rms
+            best_start = start
+    if best_rms < min_rms:
         return None
-
-    if len(audio) >= target_len:
-        start = (len(audio) - target_len) // 2
-        return audio[start : start + target_len].astype(np.float32)
-
-    # shorter than target: pad with zeros centred
-    pad = target_len - len(audio)
-    left = pad // 2
-    right = pad - left
-    return np.pad(audio, (left, right)).astype(np.float32)
+    return audio[best_start : best_start + n].astype(np.float32)
 
 
-def postprocess_audioset_clips(cfg: AudioSetConfig) -> dict[str, int]:
-    """Resample + centre-crop raw AudioSet clips into uniform 16 kHz / 3 s WAVs.
+def _existing_keys(class_dir: Path) -> set[str]:
+    if not class_dir.exists():
+        return set()
+    return {p.stem for p in class_dir.glob("*.wav")}
 
-    Output layout:
-        cfg.processed_dir / <class_key> / clip_<idx>.wav
-    Idempotent: existing clip_<idx>.wav files are not regenerated.
+
+def stream_download_audioset(cfg: AudioSetConfig) -> dict[str, int]:
+    """Streaming download from the HF AudioSet mirror.
+
+    Idempotent: filenames are `<video_id>.wav`, so re-running tops up to
+    the configured caps without re-downloading existing clips.
     """
     cfg.processed_dir.mkdir(parents=True, exist_ok=True)
+
+    focus_lookup = {c.lower(): c for c in FOCUS_CLASSES}
+
     counts: dict[str, int] = {}
-
+    seen: dict[str, set[str]] = {}
     for cls in FOCUS_CLASSES:
-        src_dir = _class_subdir(cfg.raw_dir, cls)
         key = _slugify(cls)
-        dest_dir = cfg.processed_dir / key
-        dest_dir.mkdir(parents=True, exist_ok=True)
+        existing = _existing_keys(cfg.processed_dir / key)
+        counts[key] = len(existing)
+        seen[key] = existing
+    total = sum(counts.values())
 
-        existing = sorted(dest_dir.glob("clip_*.wav"))
-        next_idx = (
-            max((int(p.stem.split("_")[1]) for p in existing), default=-1) + 1
+    if total >= cfg.max_total_clips:
+        print(
+            f"[audioset] global cap {cfg.max_total_clips} already reached "
+            f"({total} clips on disk)."
         )
-        already_processed_sources = {p.stem for p in existing}
+        return counts
 
-        if not src_dir.exists():
-            counts[key] = len(existing)
-            continue
+    print(
+        f"[audioset] streaming {cfg.hf_config}/{cfg.hf_split} via HF datasets "
+        f"(per_class_cap={cfg.clips_per_class}, global_cap={cfg.max_total_clips}, "
+        f"already on disk={total})."
+    )
 
-        raw_files = sorted(
-            p
-            for p in src_dir.iterdir()
-            if p.is_file()
-            and p.suffix.lower() in {".wav", ".ogg", ".flac", ".mp3", ".m4a"}
-        )
-        # cap at clips_per_class so postprocess can be run before download finishes
-        raw_files = raw_files[: cfg.clips_per_class]
+    ds = load_dataset(
+        "agkphysics/AudioSet",
+        cfg.hf_config,
+        split=cfg.hf_split,
+        streaming=True,
+        trust_remote_code=True,
+    )
+    ds = ds.cast_column("audio", Audio(sampling_rate=cfg.target_sample_rate))
 
-        written = 0
-        for src in tqdm(raw_files, desc=f"[audioset] postproc {key}", leave=False):
-            if src.stem in already_processed_sources:
-                continue
-            audio = _resample_centre_clip(
-                src, cfg.target_sample_rate, cfg.target_clip_duration
+    remaining = cfg.max_total_clips - total
+    pbar = tqdm(total=remaining, desc="[audioset] stream")
+
+    try:
+        for example in ds:
+            if total >= cfg.max_total_clips:
+                break
+
+            human_labels = example.get("human_labels") or []
+            matched = next(
+                (focus_lookup[lbl.lower()] for lbl in human_labels if lbl.lower() in focus_lookup),
+                None,
             )
-            if audio is None:
+            if matched is None:
                 continue
-            dest = dest_dir / f"clip_{next_idx:05d}.wav"
-            sf.write(str(dest), audio, cfg.target_sample_rate, subtype="PCM_16")
-            next_idx += 1
-            written += 1
 
-        counts[key] = len(list(dest_dir.glob("clip_*.wav")))
-        if written:
-            print(f"[audioset] {key}: wrote {written} new clips ({counts[key]} total)")
+            key = _slugify(matched)
+            if counts[key] >= cfg.clips_per_class:
+                continue
 
+            video_id = example.get("video_id") or f"sample{total:06d}"
+            if video_id in seen[key]:
+                continue
+
+            audio = example["audio"]
+            arr = np.asarray(audio["array"], dtype=np.float32)
+            if arr.ndim > 1:
+                arr = arr.mean(axis=-1)
+            sr = int(audio["sampling_rate"])
+
+            window = _loudest_window(
+                arr,
+                sr,
+                cfg.target_clip_duration,
+                cfg.window_hop_s,
+                cfg.min_rms,
+            )
+            if window is None:
+                continue
+
+            class_dir = cfg.processed_dir / key
+            class_dir.mkdir(parents=True, exist_ok=True)
+            out_path = class_dir / f"{video_id}.wav"
+            sf.write(str(out_path), window, sr, subtype="PCM_16")
+            seen[key].add(video_id)
+            counts[key] += 1
+            total += 1
+            pbar.update(1)
+    finally:
+        pbar.close()
+
+    print(f"[audioset] done — {total} clips on disk total.")
+    for cls in FOCUS_CLASSES:
+        key = _slugify(cls)
+        if counts.get(key, 0) == 0:
+            print(f"[audioset] WARNING: {cls!r} has 0 clips.")
     return counts
+
+
+async def stream_download_audioset_async(cfg: AudioSetConfig) -> dict[str, int]:
+    """Awaitable wrapper for use inside the existing notebooks."""
+    return await asyncio.to_thread(stream_download_audioset, cfg)
 
 
 def materialize_audioset_non_target(
@@ -286,7 +248,7 @@ def materialize_audioset_non_target(
     """Symlink a balanced subset of processed AudioSet clips into
     raw_dataset/subsamples/<collection_name>/non_target_audioset/.
 
-    Round-robin across classes so all 24 categories are represented.
+    Round-robin across classes so all categories are represented.
     """
     out_dir = SUBSAMPLES_DIR / collection_name / "non_target_audioset"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -294,7 +256,7 @@ def materialize_audioset_non_target(
     pools: list[list[Path]] = []
     for cls in FOCUS_CLASSES:
         key = _slugify(cls)
-        pool = sorted((cfg.processed_dir / key).glob("clip_*.wav"))
+        pool = sorted((cfg.processed_dir / key).glob("*.wav"))
         if pool:
             pools.append(pool)
 
@@ -306,7 +268,6 @@ def materialize_audioset_non_target(
     next_idx = max((int(p.stem.split("_")[1]) for p in existing), default=-1) + 1
     already_targets = {p.resolve() for p in existing}
 
-    # round-robin pick until we hit total_clips or every pool is drained
     cursors = [0] * len(pools)
     written = 0
     target = max(0, total_clips - len(existing))

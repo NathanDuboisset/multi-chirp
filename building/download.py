@@ -1,5 +1,7 @@
 """
 download.py — async XC download + BirdNET extraction pipeline.
+
+Uses the typed ``xenocanto3`` client for both listings and audio downloads.
 """
 
 from __future__ import annotations
@@ -14,17 +16,23 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-import aiohttp
-from birdnetlib import Recording
-from birdnetlib.analyzer import Analyzer as ModelAnalyzer
-from dotenv import load_dotenv
 import librosa
-from building.taxonomy import MINIMUM_QUALITY, XC_QUALITY_FILTER
 import numpy as np
 import pyrootutils
-import requests
 import soundfile as sf
+from birdnetlib import Recording as BirdNETRecording
+from birdnetlib.analyzer import Analyzer as ModelAnalyzer
+from dotenv import load_dotenv
 from tqdm import tqdm
+from xenocanto3 import (
+    AsyncXenoCantoClient,
+    Group,
+    Quality,
+    Recording,
+    XenoCantoClient,
+)
+
+from building.taxonomy import MINIMUM_QUALITY
 
 ROOT = pyrootutils.setup_root(
     search_from=__file__,
@@ -38,19 +46,19 @@ RAW_DATASET_DIR = ROOT / "raw_dataset"
 SPECIES_DIR = RAW_DATASET_DIR / "species"
 SUBSAMPLES_DIR = RAW_DATASET_DIR / "subsamples"
 LISTINGS_DIR = RAW_DATASET_DIR / "listings"
-XC_API_BASE = "https://xeno-canto.org/api/3/recordings"
 TARGET_SAMPLE_RATE = 16_000
 CLIP_DURATION = 3.0
 POOL_SIZE = 10
 BIRDNET_THRESHOLD = 0.92
 NON_TARGET_CAP = 2000
+XC_DL_INTERVAL = 0.2
+
+_LISTING_FIELDS = ("xc_id", "filename", "file_url", "quality")
 
 _analyzers: dict[int, ModelAnalyzer] = {}
 _analyzers_lock = threading.Lock()
 _stderr_lock = threading.Lock()
 _clip_indices: dict[str, int] = {}
-
-XC_DL_INTERVAL = 0.2
 
 
 @contextlib.contextmanager
@@ -74,6 +82,18 @@ class RecordingTask:
     filename: str
     file_url: str
     excluded: frozenset[str]  # lowercase names of all target species
+
+
+def _recording_to_row(rec: Recording) -> dict[str, str]:
+    file_url = (rec.file or "").strip()
+    if file_url and not file_url.startswith("http"):
+        file_url = "https:" + file_url
+    return {
+        "xc_id": str(rec.id),
+        "filename": f"XC{rec.id}.mp3",
+        "file_url": file_url,
+        "quality": rec.q,
+    }
 
 
 def _get_analyzer() -> ModelAnalyzer:
@@ -141,6 +161,7 @@ def _append_processed(
 
 def _process_recording(
     task: RecordingTask,
+    xc_client: XenoCantoClient,
     collection_name: str,
     clips_per_species: int,
     auto_delete: bool,
@@ -166,12 +187,9 @@ def _process_recording(
             return 0
 
     try:
-        with requests.get(task.file_url, timeout=60, stream=True) as dl_request:
-            dl_request.raise_for_status()
-            with audio_path.open("wb") as audiofile:
-                for chunk in dl_request.iter_content(chunk_size=8192):
-                    if chunk:
-                        audiofile.write(chunk)
+        # Reconstruct a minimal Recording so the typed client can stream the file.
+        rec = Recording(id=int(xc_id), file=task.file_url)
+        xc_client.download(rec, audio_path, overwrite=False)
     except Exception as e:
         print(f"[{task.scientific_name}] download failed {task.filename}: {e}")
         return 0
@@ -179,25 +197,25 @@ def _process_recording(
     clips_written = 0
     try:
         with quiet():
-            rec = Recording(
+            bn_rec = BirdNETRecording(
                 _get_analyzer(), str(audio_path), min_conf=BIRDNET_THRESHOLD
             )
-            rec.analyze()
+            bn_rec.analyze()
 
         target_lower = task.scientific_name.lower()
         target_dets = [
             d
-            for d in rec.detections
+            for d in bn_rec.detections
             if target_lower in d.get("scientific_name", "").lower()
         ]
         other_dets = [
             d
-            for d in rec.detections
+            for d in bn_rec.detections
             if d.get("scientific_name", "").strip().lower() not in task.excluded
             and target_lower not in d.get("scientific_name", "").lower()
         ]
-        no_detections = not rec.detections
-        del rec
+        no_detections = not bn_rec.detections
+        del bn_rec
 
         def _get_idx(key: str, directory: Path) -> int:
             if key not in _clip_indices:
@@ -277,45 +295,26 @@ def _process_recording(
 
 
 async def _fetch_listing(
-    session: aiohttp.ClientSession, scientific_name: str
+    client: AsyncXenoCantoClient, scientific_name: str
 ) -> list[dict[str, str]]:
     species_key = scientific_name.replace(" ", "_")
     listing_path = LISTINGS_DIR / f"available/{species_key}.csv"
     if listing_path.exists():
         return _read_csv(listing_path)
 
-    query = f'sp:"{scientific_name}" grp:birds {XC_QUALITY_FILTER[MINIMUM_QUALITY]}'
     rows: list[dict[str, str]] = []
-    page = 1
-    key = os.getenv("XC_API_KEY", "demo")
-    while True:
-        async with session.get(
-            XC_API_BASE,
-            params={"query": query, "key": key, "per_page": 100, "page": page},
-            timeout=30,
-        ) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
-        for rec in data.get("recordings", []):
-            file_url = str(rec.get("file", "")).strip()
-            xc_id = str(rec.get("id", "")).strip()
-            if not file_url.startswith("http"):
-                file_url = "https:" + file_url
-            rows.append(
-                {
-                    "xc_id": xc_id,
-                    "filename": f"XC{xc_id}.mp3",
-                    "file_url": file_url,
-                    "quality": str(rec.get("q", "")).strip(),
-                }
-            )
-        if page >= int(data.get("numPages", 1)) or not data.get("recordings"):
-            break
-        page += 1
+    builder = (
+        client.query()
+        .sp(scientific_name)
+        .grp(Group.BIRDS)
+        .q_min(MINIMUM_QUALITY)
+    )
+    async for rec in builder.all():
+        rows.append(_recording_to_row(rec))
 
     listing_path.parent.mkdir(parents=True, exist_ok=True)
     with listing_path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["xc_id", "filename", "file_url", "quality"])
+        w = csv.DictWriter(f, fieldnames=list(_LISTING_FIELDS))
         w.writeheader()
         w.writerows(rows)
     return rows
@@ -340,12 +339,12 @@ async def download_and_process(
     LISTINGS_DIR.mkdir(parents=True, exist_ok=True)
     (SUBSAMPLES_DIR / collection_name).mkdir(parents=True, exist_ok=True)
 
-    async with aiohttp.ClientSession(
-        connector=aiohttp.TCPConnector(limit=POOL_SIZE * 2)
-    ) as session:
+    api_key = os.getenv("XC_API_KEY", "demo")
+
+    async with AsyncXenoCantoClient(api_key=api_key) as async_client:
         print("Fetching available listings...")
         listings = await asyncio.gather(
-            *[_fetch_listing(session, name) for name in species_names]
+            *[_fetch_listing(async_client, name) for name in species_names]
         )
 
     excluded = frozenset(n.lower() for n in species_names)
@@ -401,26 +400,29 @@ async def download_and_process(
     dl_last: list[float] = [0.0]
     pbar = tqdm(total=len(jobs), desc="Download+BirdNET")
 
-    async def _run(task: RecordingTask) -> None:
-        async with dl_lock:
-            now = asyncio.get_event_loop().time()
-            wait = XC_DL_INTERVAL - (now - dl_last[0])
-            if wait > 0:
-                await asyncio.sleep(wait)
-            dl_last[0] = asyncio.get_event_loop().time()
-        async with sem:
-            await asyncio.to_thread(
-                _process_recording,
-                task,
-                collection_name,
-                clips_per_species,
-                auto_delete,
-                clip_counts,
-                locks[task.species_key],
-                nt_other_lock,
-                nt_empty_lock,
-            )
-        pbar.update(1)
+    with XenoCantoClient(api_key=api_key) as xc_client:
 
-    await asyncio.gather(*[_run(task) for task in jobs])
+        async def _run(task: RecordingTask) -> None:
+            async with dl_lock:
+                now = asyncio.get_event_loop().time()
+                wait = XC_DL_INTERVAL - (now - dl_last[0])
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                dl_last[0] = asyncio.get_event_loop().time()
+            async with sem:
+                await asyncio.to_thread(
+                    _process_recording,
+                    task,
+                    xc_client,
+                    collection_name,
+                    clips_per_species,
+                    auto_delete,
+                    clip_counts,
+                    locks[task.species_key],
+                    nt_other_lock,
+                    nt_empty_lock,
+                )
+            pbar.update(1)
+
+        await asyncio.gather(*[_run(task) for task in jobs])
     pbar.close()

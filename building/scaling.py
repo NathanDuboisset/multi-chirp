@@ -67,7 +67,6 @@ class ScalingRunConfig(BaseModel):
     threshold: float
     models_dir: Path
     results_file: Path
-    input_repr: Literal["time", "mel"] = "time"
     augment: AugmentConfig = Field(default_factory=AugmentConfig)
     # Per scaling sample, fold this many random unchosen target species into
     # the "other" class, sampled uniformly alongside the existing non_target
@@ -177,37 +176,28 @@ def _feature_config_hash() -> str:
     return hashlib.sha1(payload).hexdigest()[:8]
 
 
-def load_dataset_catalog(
-    collection: str,
-    input_repr: Literal["time", "mel"] = "time",
-    # batch_size / seed kept as kwargs so old call-sites don't break
-    batch_size: int = 32,  # noqa: ARG001 – ignored, kept for API compat
-    seed: int = 42,  # noqa: ARG001 – ignored, kept for API compat
-) -> DatasetCatalog:
+def load_dataset_catalog(collection: str) -> DatasetCatalog:
     """Build a per-class cached DatasetCatalog.
 
-    On the first call for a given (collection, input_repr) the audio files are
-    read, features are computed and written to
-    ``<root>/.cache/<collection>/<input_repr>_<cfghash>/<split>/<class>/``.
+    On the first call for a given collection the audio files are read, the
+    waveform features are computed and written to
+    ``<root>/.cache/<collection>/waveform_<cfghash>/<split>/<class>/``.
     The cfg-hash suffix invalidates the cache automatically when feature
     extraction parameters change. All subsequent calls re-use the on-disk
-    cache — no audio decoding, no numpy blobs in RAM.
+    cache — no audio decoding, no numpy blobs in RAM. The mel STFT (if
+    needed) runs at training time on the cached waveform.
     """
     from building.utils import SAMPLE_RATE, fix_audio_length_mel
 
     keras = tf.keras
     dataset_root = ROOT / "datasets" / collection
     cfg_hash = _feature_config_hash()
-    # Cache raw waveform (same shape regardless of input_repr) so augmentation
-    # can run on the waveform *before* the mel STFT.
     cache_root = ROOT / ".cache" / collection / f"waveform_{cfg_hash}"
-    _ = input_repr  # kept for API compat; no longer affects the cache.
 
     def _feature_fn(audio_batch: tf.Tensor) -> tf.Tensor:
         # fix_audio_length_mel returns [B, T] (no channel dim) — exactly
         # what we want for the unified waveform cache.
         return fix_audio_length_mel(audio_batch)
-    _ = SAMPLE_RATE  # consumed by audio_dataset_from_directory below
 
     # Discover classes (sorted so global_idx is stable across calls).
     training_dir = dataset_root / "training"
@@ -272,24 +262,10 @@ def load_dataset_catalog(
     return DatasetCatalog(class_names=class_names, entries=entries)
 
 
-# Backward-compat alias so old notebooks keep working unchanged.
-load_full_arrays = load_dataset_catalog
+def model_factory(name: str) -> Callable[[int], tf.keras.Model]:
+    from building.models import build_model
 
-
-def model_factory(
-    name: str, input_repr: Literal["time", "mel"] = "time"
-) -> Callable[[int], tf.keras.Model]:
-    if input_repr == "time":
-        from building.time_models import get_time_model, TARGET_AUDIO_LEN
-
-        time_model = get_time_model(name)
-        return lambda n_classes: time_model(n_classes, TARGET_AUDIO_LEN)
-    elif input_repr == "mel":
-        from building.mel_models import get_mel_model
-
-        mel_model = get_mel_model(name)
-        return lambda n_classes: mel_model(n_classes)
-    raise ValueError(f"Unknown model: {name}")
+    return lambda n_classes: build_model(name, n_classes)
 
 
 def _make_augment_fn(cfg: AugmentConfig) -> Callable[[tf.Tensor], tf.Tensor]:
@@ -546,8 +522,11 @@ def run_experiments(
     run_baseline: bool = True,
     run_scaling: bool = True,
 ) -> list[RunResult]:
+    from building.models import input_repr_for
+
     rng = np.random.default_rng(config.seed)
-    model_builder = model_factory(config.build_model, config.input_repr)
+    model_builder = model_factory(config.build_model)
+    input_repr: Literal["time", "mel"] = input_repr_for(config.build_model)
     config.models_dir.mkdir(parents=True, exist_ok=True)
     config.results_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -584,7 +563,7 @@ def run_experiments(
                 config.batch_size,
                 rng,
                 split="train",
-                input_repr=config.input_repr,
+                input_repr=input_repr,
                 augment=config.augment,
                 extra_other_idxs=extra_other_idxs,
             )
@@ -595,7 +574,7 @@ def run_experiments(
                 config.batch_size,
                 rng,
                 split="val",
-                input_repr=config.input_repr,
+                input_repr=input_repr,
                 augment=None,
                 extra_other_idxs=extra_other_idxs,
             )
@@ -606,7 +585,7 @@ def run_experiments(
                 config.batch_size,
                 rng,
                 split="test",
-                input_repr=config.input_repr,
+                input_repr=input_repr,
                 augment=None,
                 extra_other_idxs=extra_other_idxs,
             )

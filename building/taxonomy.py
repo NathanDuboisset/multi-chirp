@@ -2,21 +2,22 @@
 taxonomy.py — download/cache bird taxonomy and select species for experiments.
 
 Uses the eBird/Clements taxonomy CSV (Cornell Lab) for order/family/genus/species
-hierarchy, and queries XC API v3 to filter species with enough recordings.
+hierarchy, and queries XC API v3 (via the typed ``xenocanto3`` client) to filter
+species with enough recordings.
 """
 
 from __future__ import annotations
 
 import os
 import time
-from typing import Optional
 
-import pyrootutils
 import pandas as pd
+import pyrootutils
 import requests
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from tqdm.auto import tqdm
+from xenocanto3 import Group, Quality, XenoCantoClient
 
 ROOT = pyrootutils.setup_root(
     search_from=__file__,
@@ -32,15 +33,8 @@ EBIRD_TAXONOMY_URL = (
 )
 RAW_DATASET_DIR = ROOT / "raw_dataset"
 TAXONOMY_CACHE = RAW_DATASET_DIR / "taxonomy_cache.csv"
-XC_API_BASE = "https://xeno-canto.org/api/3/recordings"
 
-MINIMUM_QUALITY: str = "B"
-
-XC_QUALITY_FILTER: dict[str, str] = {
-    "A": "q:A",
-    "B": 'q:">C"',
-    "C": 'q:">D"',
-}
+MINIMUM_QUALITY: Quality = Quality.B
 
 
 class SpeciesInfo(BaseModel):
@@ -53,12 +47,12 @@ class SpeciesInfo(BaseModel):
     num_recordings_b: int = 0
     num_recordings_c: int = 0
 
-    def recordings_at_least(self, min_quality: str = MINIMUM_QUALITY) -> int:
+    def recordings_at_least(self, min_quality: Quality = MINIMUM_QUALITY) -> int:
         """Cumulative count for quality >= min_quality (A ⊇ B ⊇ C)."""
         total = self.num_recordings_a
-        if min_quality in ("B", "C"):
+        if min_quality in (Quality.B, Quality.C):
             total += self.num_recordings_b
-        if min_quality == "C":
+        if min_quality == Quality.C:
             total += self.num_recordings_c
         return total
 
@@ -88,22 +82,23 @@ def _fetch_ebird_taxonomy() -> pd.DataFrame:
     return df.dropna(subset=["genus", "species_epithet"])
 
 
-def _query_xc_counts(genus: str, epithet: str, api_key: str) -> dict[str, int]:
+def _query_xc_counts(
+    client: XenoCantoClient, genus: str, epithet: str
+) -> dict[str, int]:
     """Query XC for quality-A, B, C recording counts. Returns {a, b, c}."""
     counts: dict[str, int] = {"a": 0, "b": 0, "c": 0}
-    for key_q, q_filter in (("a", "q:A"), ("b", "q:B"), ("c", "q:C")):
+    for key_q, quality in (("a", Quality.A), ("b", Quality.B), ("c", Quality.C)):
         try:
-            resp = requests.get(
-                XC_API_BASE,
-                params={
-                    "query": f'sp:"{genus} {epithet}" grp:birds {q_filter}',
-                    "key": api_key,
-                    "per_page": 1,
-                },
-                timeout=30,
+            page = (
+                client.query()
+                .gen(genus)
+                .sp(epithet)
+                .grp(Group.BIRDS)
+                .q(quality)
+                .per_page(1)
+                .fetch()
             )
-            resp.raise_for_status()
-            counts[key_q] = int(resp.json().get("numRecordings", 0))
+            counts[key_q] = page.num_recordings
         except Exception:
             pass
         time.sleep(0.2)
@@ -136,7 +131,7 @@ def get_species_with_recordings(
 
     cached_data = _load_cache()
 
-    def _to_species(d: dict) -> Optional[SpeciesInfo]:
+    def _to_species(d: dict) -> SpeciesInfo | None:
         try:
             return SpeciesInfo(**d)
         except Exception:
@@ -170,26 +165,27 @@ def get_species_with_recordings(
         pending.clear()
 
     pbar = tqdm(uncached.iterrows(), total=len(uncached), desc="Querying XC")
-    for _, row in pbar:
-        sci_name = row["scientific_name"]
-        pbar.set_description(sci_name)
-        counts = _query_xc_counts(row["genus"], row["species_epithet"], api_key)
-        pbar.set_postfix(A=counts["a"], B=counts["b"], C=counts["c"])
-        entry = dict(
-            scientific_name=sci_name,
-            genus=row["genus"],
-            species_epithet=row["species_epithet"],
-            family=row["family"],
-            order=row["order"],
-            num_recordings_a=counts["a"],
-            num_recordings_b=counts["b"],
-            num_recordings_c=counts["c"],
-        )
-        cached_data[sci_name] = entry
-        pending.append(entry)
-        if len(pending) >= 10:
-            _flush()
-    _flush()
+    with XenoCantoClient(api_key=api_key) as client:
+        for _, row in pbar:
+            sci_name = row["scientific_name"]
+            pbar.set_description(sci_name)
+            counts = _query_xc_counts(client, row["genus"], row["species_epithet"])
+            pbar.set_postfix(A=counts["a"], B=counts["b"], C=counts["c"])
+            entry = dict(
+                scientific_name=sci_name,
+                genus=row["genus"],
+                species_epithet=row["species_epithet"],
+                family=row["family"],
+                order=row["order"],
+                num_recordings_a=counts["a"],
+                num_recordings_b=counts["b"],
+                num_recordings_c=counts["c"],
+            )
+            cached_data[sci_name] = entry
+            pending.append(entry)
+            if len(pending) >= 10:
+                _flush()
+        _flush()
 
     return [
         s
@@ -201,8 +197,8 @@ def get_species_with_recordings(
 def select_same_genus(
     genus: str,
     n: int,
-    species_pool: Optional[list[SpeciesInfo]] = None,
-    avoid: Optional[list[str]] = None,
+    species_pool: list[SpeciesInfo] | None = None,
+    avoid: list[str] | None = None,
 ) -> list[SpeciesInfo]:
     pool = species_pool or get_species_with_recordings()
     avoid_set = set(avoid or [])
@@ -222,8 +218,8 @@ def select_same_genus(
 def select_same_family(
     family: str,
     n: int,
-    species_pool: Optional[list[SpeciesInfo]] = None,
-    avoid: Optional[list[str]] = None,
+    species_pool: list[SpeciesInfo] | None = None,
+    avoid: list[str] | None = None,
 ) -> list[SpeciesInfo]:
     pool = species_pool or get_species_with_recordings()
     avoid_set = set(avoid or [])
@@ -250,8 +246,8 @@ def select_same_family(
 def select_same_order(
     order: str,
     n: int,
-    species_pool: Optional[list[SpeciesInfo]] = None,
-    avoid: Optional[list[str]] = None,
+    species_pool: list[SpeciesInfo] | None = None,
+    avoid: list[str] | None = None,
 ) -> list[SpeciesInfo]:
     pool = species_pool or get_species_with_recordings()
     avoid_set = set(avoid or [])
@@ -275,7 +271,7 @@ def select_same_order(
     return selected
 
 
-def _min_top_n_rec(items: list[SpeciesInfo], taxon_level: str, n: int) -> Optional[int]:
+def _min_top_n_rec(items: list[SpeciesInfo], taxon_level: str, n: int) -> int | None:
     """Simulate the greedy top-N selection and return the min recording count."""
     sorted_items = sorted(items, key=lambda s: -s.num_recordings)
     if taxon_level == "genus":
@@ -305,9 +301,9 @@ def get_potential_taxa(
     taxon_level: str,
     n: int,
     min_recordings: int = 100,
-    species_pool: Optional[list[SpeciesInfo]] = None,
+    species_pool: list[SpeciesInfo] | None = None,
     force_refresh: bool = False,
-    top_k: Optional[int] = 50,
+    top_k: int | None = 50,
 ) -> pd.DataFrame:
     """
     List candidate taxa that can support choosing `n` items with `min_recordings`.
@@ -359,7 +355,6 @@ def get_potential_taxa(
 
     df = pd.DataFrame(rows)
     if df.empty:
-        # Ensure stable columns even when empty.
         return pd.DataFrame(
             columns=[
                 taxon_level_lower,
