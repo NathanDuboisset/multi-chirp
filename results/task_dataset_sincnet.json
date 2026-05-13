@@ -1,0 +1,89 @@
+{
+  "collection": "task_dataset",
+  "build_model": "sincnet",
+  "timestamp": "2026-05-13T14:56:50.007653+00:00",
+  "epochs_trained": 100,
+  "class_names": [
+    "Emberiza_calandra",
+    "Hippolais_polyglotta",
+    "Regulus_ignicapilla",
+    "non_target"
+  ],
+  "test_loss": 0.10058090090751648,
+  "top1_accuracy": 0.9275064267352185,
+  "macro": {
+    "precision": 0.8786487618902925,
+    "recall": 0.9438379713556728,
+    "f1": 0.9085040471891328,
+    "f2": 0.9289909587602618,
+    "auc_ovr": 0.990871725499449
+  },
+  "per_class": {
+    "Emberiza_calandra": {
+      "support": 417,
+      "precision": 0.851931330472103,
+      "recall": 0.9520383693045563,
+      "f1": 0.89920724801812,
+      "f2": 0.930178069353327,
+      "auc_ovr": 0.9938304467281345
+    },
+    "Hippolais_polyglotta": {
+      "support": 454,
+      "precision": 0.8385214007782101,
+      "recall": 0.9493392070484582,
+      "f1": 0.8904958677685951,
+      "f2": 0.9248927038626611,
+      "auc_ovr": 0.9929196176272994
+    },
+    "Regulus_ignicapilla": {
+      "support": 450,
+      "precision": 0.8454011741682974,
+      "recall": 0.96,
+      "f1": 0.899063475546306,
+      "f2": 0.9346603202077023,
+      "auc_ovr": 0.9930723514211885
+    },
+    "non_target": {
+      "support": 2569,
+      "precision": 0.9787411421425594,
+      "recall": 0.9139743090696769,
+      "f1": 0.9452495974235103,
+      "f2": 0.926232741617357,
+      "auc_ovr": 0.9836644862211738
+    }
+  },
+  "confusion_matrix": [
+    [
+      397,
+      5,
+      0,
+      15
+    ],
+    [
+      0,
+      431,
+      0,
+      23
+    ],
+    [
+      3,
+      2,
+      432,
+      13
+    ],
+    [
+      66,
+      76,
+      79,
+      2348
+    ]
+  ],
+  "hyperparams": {
+    "epochs": 100,
+    "patience": 15,
+    "batch_size": 32,
+    "seed": 42,
+    "threshold": 0.5,
+    "input_repr": "time"
+  }
+}

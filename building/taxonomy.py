@@ -1,10 +1,4 @@
-"""
-taxonomy.py — download/cache bird taxonomy and select species for experiments.
-
-Uses the eBird/Clements taxonomy CSV (Cornell Lab) for order/family/genus/species
-hierarchy, and queries XC API v3 (via the typed ``xenocanto3`` client) to filter
-species with enough recordings.
-"""
+"""Bird taxonomy cache (eBird/Clements) + species selection helpers."""
 
 from __future__ import annotations
 
@@ -26,7 +20,7 @@ ROOT = pyrootutils.setup_root(
     dotenv=True,
 )
 load_dotenv()
-# CITATE : https://www.birds.cornell.edu/clementschecklist/introduction/updateindex/october-2025/2025-citation-checklist-downloads/
+# Citation: https://www.birds.cornell.edu/clementschecklist/introduction/updateindex/october-2025/2025-citation-checklist-downloads/
 EBIRD_TAXONOMY_URL = (
     "https://www.birds.cornell.edu/clementschecklist/wp-content/uploads/2025/10/"
     "eBird_taxonomy_v2025.csv"

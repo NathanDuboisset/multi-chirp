@@ -1,12 +1,4 @@
-"""
-analysis.py — area-scoped Xeno-Canto exploration.
-
-Given a center coordinate and a few target species, fetch XC metadata, build a
-per-species heatmap, and summarize what else lives in the area (co-occurring
-species, taxonomy spread, time-bounded annotations). Optionally download the
-area's recordings and run BirdNET to surface species the recordists did not
-declare in ``also``.
-"""
+"""Area-scoped XC exploration: heatmaps, taxonomy, BirdNET pass."""
 
 from __future__ import annotations
 
@@ -30,12 +22,12 @@ from xenocanto3 import AsyncXenoCantoClient, Group, Quality, Recording
 from building.download import (
     BIRDNET_THRESHOLD,
     POOL_SIZE,
-    XC_DL_INTERVAL,
-    _get_analyzer,
-    _require_ffmpeg,
+    get_analyzer,
     quiet,
 )
 from building.taxonomy import MINIMUM_QUALITY
+
+XC_DL_INTERVAL = 0.2  # seconds between successive XC downloads (rate limit)
 
 ROOT = pyrootutils.setup_root(
     search_from=__file__,
@@ -53,7 +45,7 @@ BBox = tuple[float, float, float, float]  # (lat_min, lon_min, lat_max, lon_max)
 
 
 def bbox_from_radius(lat: float, lon: float, radius_km: float) -> BBox:
-    """Center + radius → bounding box. 1° lat ≈ 111 km; lon scales by cos(lat)."""
+    """Center + radius to (lat_min, lon_min, lat_max, lon_max)."""
     dlat = radius_km / 111.0
     dlon = radius_km / (111.0 * max(math.cos(math.radians(lat)), 1e-6))
     return (lat - dlat, lon - dlon, lat + dlat, lon + dlon)
@@ -292,6 +284,16 @@ AUDIO_CACHE_DIR = ANALYSIS_DIR / "audio"
 BIRDNET_CACHE_DIR = ANALYSIS_DIR / "birdnet_cache"
 
 
+def area_audio_cache_dir(
+    lat: float,
+    lon: float,
+    radius_km: float,
+    base: Path = AUDIO_CACHE_DIR,
+) -> Path:
+    """Per-area audio cache folder so multiple areas don't share mp3 files."""
+    return base / f"r{radius_km:g}km_lat{lat:.4f}_lon{lon:.4f}"
+
+
 def _cache_path(xc_id: int) -> Path:
     return BIRDNET_CACHE_DIR / f"XC{xc_id}.json"
 
@@ -335,31 +337,17 @@ async def birdnet_area_analysis(
     pool_size: int = POOL_SIZE,
     delete_audio_after_cache: bool = False,
 ) -> dict[str, pd.DataFrame]:
-    """Download area recordings (cached, resumable) and run BirdNET on each.
-
-    Detections are cached per recording at ``BIRDNET_CACHE_DIR``; re-runs at the
-    same or stricter confidence threshold skip download and analysis entirely.
-
-    Returns:
-        detections — one row per BirdNET detection, with a ``declared`` flag
-            (True if the detected species was XC-listed as the primary species
-            or in ``also`` for that recording).
-        by_species — aggregated counts per detected species, including how
-            many of those detections were *undeclared* in XC metadata.
-        hidden — species with ≥1 undeclared detection, sorted by undeclared
-            count (the "hiding in the recordings" view the recordists missed).
-    """
+    """Download area recordings (cached) and BirdNET each. Returns
+    {detections, by_species, hidden}."""
     work = area_df.dropna(subset=["file"]).reset_index(drop=True)
     if max_recordings is not None:
         work = work.head(max_recordings)
 
-    # Only enforce ffmpeg / create the audio dir if we'll actually download.
     needs_audio = any(
         _load_cached_detections(int(row.id), min_confidence) is None
         for row in work.itertuples()
     )
     if needs_audio:
-        _require_ffmpeg()
         cache_dir.mkdir(parents=True, exist_ok=True)
 
     detections: list[dict] = []
@@ -454,16 +442,8 @@ def combined_species_table(
     birdnet_detections: pd.DataFrame,
     min_recordings: int = 1,
 ) -> pd.DataFrame:
-    """Per-species evidence in the area, split by source. The three count
-    columns are mutually exclusive *per recording*:
-
-    - xc_primary  — area recordings whose primary species is this one
-    - xc_also     — area recordings that list this species in ``also``
-    - birdnet_only — area recordings where BirdNET detected this species
-      and it was *not* listed by the recordist (neither primary nor in ``also``)
-
-    Rows kept: ``xc_primary + xc_also + birdnet_only >= min_recordings``.
-    """
+    """Per-species evidence: xc_primary, xc_also, birdnet_only (mutually
+    exclusive per recording). Rows kept: total >= min_recordings."""
     xc_primary = (
         area_df.groupby("scientific_name").size().rename("xc_primary")
     )
@@ -505,8 +485,36 @@ def combined_species_table(
     )
 
 
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371.0088
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlmb / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def longest_recordings(
+    area_df: pd.DataFrame,
+    center: tuple[float, float],
+    top_n: int = 10,
+) -> pd.DataFrame:
+    """Top-N longest recordings in the area, with haversine distance (km) to ``center``."""
+    df = area_df.dropna(subset=["length_seconds"]).copy()
+    lat0, lon0 = center
+    df["distance_km"] = [
+        _haversine_km(lat0, lon0, lat, lon) if pd.notna(lat) and pd.notna(lon) else float("nan")
+        for lat, lon in zip(df["lat"], df["lon"])
+    ]
+    df = df.sort_values("length_seconds", ascending=False).head(top_n)
+    out = df[["id", "scientific_name", "en", "length_seconds", "distance_km", "q", "loc", "date"]].copy()
+    out["length_seconds"] = out["length_seconds"].round(1)
+    out["distance_km"] = out["distance_km"].round(2)
+    return out.reset_index(drop=True)
+
+
 def _run_birdnet(audio_path: Path, min_confidence: float) -> list[dict]:
     with quiet():
-        bn = BirdNETRecording(_get_analyzer(), str(audio_path), min_conf=min_confidence)
+        bn = BirdNETRecording(get_analyzer(), str(audio_path), min_conf=min_confidence)
         bn.analyze()
     return list(bn.detections)

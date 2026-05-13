@@ -22,7 +22,7 @@ ROOT = pyrootutils.setup_root(
 )
 
 FIT_VERBOSE = 2
-# Per-class shuffle buffer cap. Each unit ≈ 47872 × 4 B = 192 KB of resident
+# Per-class shuffle buffer cap. Each unit ≈ 48000 × 4 B = 187 KB of resident
 # RAM, held for the duration of the epoch. At k=10 classes the total is
 # SHUFFLE_BUFFER_CAP × 10 × 192 KB. Keep small; the file-level shuffle in
 # dataset.py already provides bulk randomness.
@@ -45,18 +45,6 @@ def configure_tf_for_long_runs() -> None:
 configure_tf_for_long_runs()
 
 
-class AugmentConfig(BaseModel):
-    """Waveform-level augmentations applied only to the training split,
-    *before* the mel spectrogram is computed."""
-
-    enabled: bool = True
-    polarity_flip_prob: float = 0.5
-    time_shift_max_seconds: float = 0.1
-    gaussian_std: float = 0.005
-    gain_min: float = 0.9
-    gain_max: float = 1.1
-
-
 class ScalingRunConfig(BaseModel):
     collection: str
     build_model: str
@@ -67,7 +55,7 @@ class ScalingRunConfig(BaseModel):
     threshold: float
     models_dir: Path
     results_file: Path
-    augment: AugmentConfig = Field(default_factory=AugmentConfig)
+    augment: bool = True
     # Per scaling sample, fold this many random unchosen target species into
     # the "other" class, sampled uniformly alongside the existing non_target
     # bucket. Keeps "other" diversity comparable across k values.
@@ -154,11 +142,12 @@ class BaselineSummary(BaseModel):
 
 @dataclass
 class DatasetMeta:
-    n_each: int
+    epoch_samples: int
     n_classes: int
+    class_weights: dict[int, float] | None = None
 
 
-_CACHE_BATCH = 64  # batch size used only during cache-population pass
+_CACHE_BATCH = 1  # one file per batch so a corrupt clip only drops itself
 
 
 def _feature_config_hash() -> str:
@@ -176,17 +165,27 @@ def _feature_config_hash() -> str:
     return hashlib.sha1(payload).hexdigest()[:8]
 
 
-def load_dataset_catalog(collection: str) -> DatasetCatalog:
-    """Build a per-class cached DatasetCatalog.
+def cleanup_waveform_cache(collection: str) -> None:
+    """Wipe the waveform cache for a collection.
 
-    On the first call for a given collection the audio files are read, the
-    waveform features are computed and written to
-    ``<root>/.cache/<collection>/waveform_<cfghash>/<split>/<class>/``.
-    The cfg-hash suffix invalidates the cache automatically when feature
-    extraction parameters change. All subsequent calls re-use the on-disk
-    cache — no audio decoding, no numpy blobs in RAM. The mel STFT (if
-    needed) runs at training time on the cached waveform.
+    Useful at the end of training to reclaim disk space and to guarantee the
+    next run rebuilds from the current files on disk (the cache key is keyed
+    only on the feature config, not the file-set, so it doesn't auto-invalidate
+    when the dataset folder is edited).
     """
+    import shutil
+
+    cache_root = ROOT / ".cache" / collection
+    if not cache_root.exists():
+        print(f"[cleanup] no cache at {cache_root}")
+        return
+    size_mb = sum(p.stat().st_size for p in cache_root.rglob("*") if p.is_file()) / 1e6
+    shutil.rmtree(cache_root)
+    print(f"[cleanup] removed {cache_root} ({size_mb:,.1f} MB freed)")
+
+
+def load_dataset_catalog(collection: str) -> DatasetCatalog:
+    """Per-class cached waveform DatasetCatalog. Cache invalidates via cfg hash."""
     from building.utils import SAMPLE_RATE, fix_audio_length_mel
 
     keras = tf.keras
@@ -195,11 +194,8 @@ def load_dataset_catalog(collection: str) -> DatasetCatalog:
     cache_root = ROOT / ".cache" / collection / f"waveform_{cfg_hash}"
 
     def _feature_fn(audio_batch: tf.Tensor) -> tf.Tensor:
-        # fix_audio_length_mel returns [B, T] (no channel dim) — exactly
-        # what we want for the unified waveform cache.
         return fix_audio_length_mel(audio_batch)
 
-    # Discover classes (sorted so global_idx is stable across calls).
     training_dir = dataset_root / "training"
     class_names = sorted(d.name for d in training_dir.iterdir() if d.is_dir())
 
@@ -223,9 +219,18 @@ def load_dataset_catalog(collection: str) -> DatasetCatalog:
             sampling_rate=SAMPLE_RATE,
             batch_size=_CACHE_BATCH,
             shuffle=False,
+            verbose=False,
         )
         ds: tf.data.Dataset = (
-            ds_raw.map(lambda x, _: _feature_fn(x), num_parallel_calls=tf.data.AUTOTUNE)
+            ds_raw
+            # AudioSet downloads occasionally contain corrupt headers; skip
+            # them rather than aborting the whole class. log_warning prints
+            # the offending file path so it can be removed at leisure.
+            .apply(tf.data.experimental.ignore_errors(log_warning=True))
+            .map(
+                tf.autograph.experimental.do_not_convert(lambda x, _: _feature_fn(x)),
+                num_parallel_calls=tf.data.AUTOTUNE,
+            )
             .unbatch()
             .cache(cache_path)
         )
@@ -245,6 +250,10 @@ def load_dataset_catalog(collection: str) -> DatasetCatalog:
             count_file.write_text(json.dumps({"count": count}))
             print(f"{count} samples")
 
+        # ignore_errors() makes cardinality UNKNOWN, which then propagates
+        # all the way to Keras and triggers spurious "ran out of data"
+        # warnings. We know the real count from the cache, so assert it.
+        ds = ds.apply(tf.data.experimental.assert_cardinality(count))
         return ClassSplit(ds=ds, count=count)
 
     entries: list[ClassEntry] = []
@@ -268,44 +277,6 @@ def model_factory(name: str) -> Callable[[int], tf.keras.Model]:
     return lambda n_classes: build_model(name, n_classes)
 
 
-def _make_augment_fn(cfg: AugmentConfig) -> Callable[[tf.Tensor], tf.Tensor]:
-    """Build a per-sample waveform augmentation function. Input/output: [T]."""
-    from building.utils import SAMPLE_RATE
-
-    max_shift = int(cfg.time_shift_max_seconds * SAMPLE_RATE)
-    flip_prob = float(cfg.polarity_flip_prob)
-    gain_lo = float(cfg.gain_min)
-    gain_hi = float(cfg.gain_max)
-    noise_std = float(cfg.gaussian_std)
-
-    def augment(audio: tf.Tensor) -> tf.Tensor:
-        # polarity flip
-        if flip_prob > 0:
-            flip = tf.cast(
-                tf.random.uniform([], 0.0, 1.0) < flip_prob, audio.dtype
-            )
-            audio = audio * (1.0 - 2.0 * flip)
-        # random gain
-        if gain_lo != 1.0 or gain_hi != 1.0:
-            audio = audio * tf.random.uniform(
-                [], gain_lo, gain_hi, dtype=audio.dtype
-            )
-        # additive gaussian
-        if noise_std > 0:
-            audio = audio + tf.random.normal(
-                tf.shape(audio), stddev=noise_std, dtype=audio.dtype
-            )
-        # time shift (wrap-around; <0.1 s on 3 s clip is negligible)
-        if max_shift > 0:
-            shift = tf.random.uniform(
-                [], -max_shift, max_shift + 1, dtype=tf.int32
-            )
-            audio = tf.roll(audio, shift=shift, axis=0)
-        return audio
-
-    return augment
-
-
 def _build_dataset_from_catalog(
     catalog: DatasetCatalog,
     chosen_idxs: list[int],
@@ -314,22 +285,22 @@ def _build_dataset_from_catalog(
     rng: np.random.Generator,
     split: Literal["train", "val", "test"],
     input_repr: Literal["time", "mel"] = "time",
-    augment: AugmentConfig | None = None,
+    augment: bool = False,
     extra_other_idxs: list[int] | None = None,
 ) -> tuple[tf.data.Dataset, DatasetMeta]:
     """Build a batched TF dataset for one experiment from the on-disk catalog.
 
-    Train: each class is shuffled independently and repeated, then interleaved
-    via ``sample_from_datasets`` so every batch is class-balanced regardless of
-    class size. Epoch length is bounded to ``min(counts) * n_classes`` so smaller
-    classes see all their data and larger classes see a fresh subset each epoch
-    (reshuffle_each_iteration=True).
-    Val/Test: full concatenation, no resampling.
+    Train: every class's per-class waveform dataset is concatenated under the
+    natural distribution and globally shuffled. One epoch = one pass over every
+    training sample. Per-class inverse-frequency weights (mean-normalised to 1)
+    are emitted as the ``sample_weight`` element of each ``(x, y, sw)`` batch
+    tuple so Keras reweights the loss without further plumbing.
+    Val/Test: full concatenation, no resampling, no sample weights — eval loss
+    reflects the natural distribution.
 
     The "other" class is the union of ``non_target_idx`` and any
-    ``extra_other_idxs`` (unchosen target species folded in). For training the
-    sub-buckets are mixed uniformly via ``sample_from_datasets``; for val/test
-    they are simply concatenated under the same label.
+    ``extra_other_idxs`` (unchosen target species folded in); sub-buckets are
+    concatenated under the same label.
     No numpy arrays are allocated; RAM usage is O(batch_size × sample_size).
     """
     extras = list(extra_other_idxs or [])
@@ -360,86 +331,84 @@ def _build_dataset_from_catalog(
     other_label = len(chosen_idxs)
     do_shuffle = split == "train"
 
-    if do_shuffle:
-        n_each = min(target_counts)
-        epoch_len = n_each * n_classes
-        parts: list[tf.data.Dataset] = []
-        for local_label, (cs, count) in enumerate(
-            zip(target_class_splits, target_counts)
-        ):
-            lbl = tf.constant(local_label, dtype=tf.int32)
-            shuffle_buf = min(count, SHUFFLE_BUFFER_CAP)
-            seed = int(rng.integers(0, 2**31 - 1))
-            ds = (
-                cs.ds.shuffle(
-                    shuffle_buf, seed=seed, reshuffle_each_iteration=True
-                )
-                .repeat()
-                .map(lambda x, label=lbl: (x, label))
-            )
-            parts.append(ds)
+    # AutoGraph can't introspect lambdas/closures defined here when this module
+    # is reloaded inside a notebook, so wrap every map fn with do_not_convert.
+    nag = tf.autograph.experimental.do_not_convert
 
-        # Build the merged "other" stream: each sub-bucket shuffled+repeated,
-        # then mixed uniformly so the audioset/empty/extra-species sources are
-        # represented evenly within the "other" share of every batch.
-        other_sub_parts: list[tf.data.Dataset] = []
-        for cs, count in zip(other_class_splits, other_counts):
+    # Build per-class labelled streams. counts_by_label is the natural epoch
+    # budget per class — what we'd like to see in one full pass.
+    counts_by_label: dict[int, int] = {}
+    raw_per_class: list[tf.data.Dataset] = []
+    for local_label, (cs, count) in enumerate(
+        zip(target_class_splits, target_counts)
+    ):
+        lbl = tf.constant(local_label, dtype=tf.int32)
+        raw_per_class.append(cs.ds.map(nag(lambda x, label=lbl: (x, label))))
+        counts_by_label[local_label] = count
+
+    olbl = tf.constant(other_label, dtype=tf.int32)
+    other_ds = other_class_splits[0].ds.map(nag(lambda x, label=olbl: (x, label)))
+    for cs in other_class_splits[1:]:
+        other_ds = other_ds.concatenate(
+            cs.ds.map(nag(lambda x, label=olbl: (x, label)))
+        )
+    raw_per_class.append(other_ds)
+    counts_by_label[other_label] = sum(other_counts)
+
+    total_samples = sum(counts_by_label.values())
+
+    if do_shuffle:
+        # Weighted interleave: each per-class stream is shuffled within its
+        # own buffer (cheap, since per-class buffer fits well under
+        # SHUFFLE_BUFFER_CAP) and repeated; sample_from_datasets mixes them
+        # in natural-distribution proportions every batch. Epoch length is
+        # pinned to total_samples so cardinality is known.
+        per_class_streams: list[tf.data.Dataset] = []
+        for lbl_idx, ds_lbl in enumerate(raw_per_class):
+            count = counts_by_label[lbl_idx]
             shuffle_buf = min(count, SHUFFLE_BUFFER_CAP)
             seed = int(rng.integers(0, 2**31 - 1))
-            other_sub_parts.append(
-                cs.ds.shuffle(
+            per_class_streams.append(
+                ds_lbl.shuffle(
                     shuffle_buf, seed=seed, reshuffle_each_iteration=True
                 ).repeat()
             )
-        if len(other_sub_parts) == 1:
-            other_stream = other_sub_parts[0]
-        else:
-            sub_weights = [1.0 / len(other_sub_parts)] * len(other_sub_parts)
-            other_stream = tf.data.Dataset.sample_from_datasets(
-                other_sub_parts,
-                weights=sub_weights,
-                seed=int(rng.integers(0, 2**31 - 1)),
-                stop_on_empty_dataset=False,
-            )
-        olbl = tf.constant(other_label, dtype=tf.int32)
-        parts.append(other_stream.map(lambda x, label=olbl: (x, label)))
-
-        weights = [1.0 / n_classes] * n_classes
+        weights = [counts_by_label[i] / total_samples for i in range(n_classes)]
         combined = tf.data.Dataset.sample_from_datasets(
-            parts,
+            per_class_streams,
             weights=weights,
             seed=int(rng.integers(0, 2**31 - 1)),
             stop_on_empty_dataset=False,
-        ).take(epoch_len)
+        ).take(total_samples)
     else:
-        n_each = max(max(target_counts), sum(other_counts))
-        parts = []
-        for local_label, cs in enumerate(target_class_splits):
-            lbl = tf.constant(local_label, dtype=tf.int32)
-            parts.append(cs.ds.map(lambda x, label=lbl: (x, label)))
-        olbl = tf.constant(other_label, dtype=tf.int32)
-        other_ds = other_class_splits[0].ds.map(
-            lambda x, label=olbl: (x, label)
-        )
-        for cs in other_class_splits[1:]:
-            other_ds = other_ds.concatenate(
-                cs.ds.map(lambda x, label=olbl: (x, label))
-            )
-        parts.append(other_ds)
-        combined = parts[0]
-        for p in parts[1:]:
+        combined = raw_per_class[0]
+        for p in raw_per_class[1:]:
             combined = combined.concatenate(p)
+
+    # Mean-normalised inverse-frequency weights: w_c = N / (K * n_c), then
+    # rescaled so the mean weight = 1 (keeps the loss scale comparable).
+    raw_weights = {
+        lbl: total_samples / (n_classes * count)
+        for lbl, count in counts_by_label.items()
+    }
+    mean_w = sum(raw_weights.values()) / len(raw_weights)
+    class_weights = {lbl: w / mean_w for lbl, w in raw_weights.items()}
 
     # Per-sample waveform augmentation (train split only). Runs *before* the
     # mel STFT so polarity flip / shift / noise affect the spectrogram.
-    if do_shuffle and augment is not None and augment.enabled:
-        aug_fn = _make_augment_fn(augment)
+    if do_shuffle and augment:
+        from building.audio_augmentation import augment_tf
+
         combined = combined.map(
-            lambda x, y: (aug_fn(x), y),
+            nag(lambda x, y: (augment_tf(x), y)),
             num_parallel_calls=tf.data.AUTOTUNE,
         )
 
     combined = combined.batch(batch_size)
+
+    cw_tensor = tf.constant(
+        [class_weights[i] for i in range(n_classes)], dtype=tf.float32
+    )
 
     if input_repr == "mel":
         from building.utils import (
@@ -448,25 +417,45 @@ def _build_dataset_from_catalog(
             NUM_MEL_BINS_MEL,
         )
 
-        def _to_features(xb: tf.Tensor, yb: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
+        @nag
+        def _featurize(xb: tf.Tensor) -> tf.Tensor:
             spec = create_log_mel_spectrogram(xb)
             spec = tf.ensure_shape(
                 spec, [None, TARGET_FRAMES_MEL, NUM_MEL_BINS_MEL]
             )
-            return tf.expand_dims(spec, -1), tf.one_hot(
-                yb, n_classes, dtype=tf.float32
-            )
+            return tf.expand_dims(spec, -1)
     else:
 
-        def _to_features(xb: tf.Tensor, yb: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
-            return tf.expand_dims(xb, -1), tf.one_hot(
-                yb, n_classes, dtype=tf.float32
+        @nag
+        def _featurize(xb: tf.Tensor) -> tf.Tensor:
+            return tf.expand_dims(xb, -1)
+
+    # Emit sample_weight for train + val (Keras consumes the 3-tuple
+    # natively and EarlyStopping then monitors a class-balanced val_loss).
+    # Test stays as a 2-tuple so the downstream metric helpers iterate it
+    # as (xb, yb) and report the honest natural-distribution test loss.
+    weighted = split in ("train", "val")
+    if weighted:
+        @nag
+        def _to_features(xb: tf.Tensor, yb: tf.Tensor):
+            return (
+                _featurize(xb),
+                tf.one_hot(yb, n_classes, dtype=tf.float32),
+                tf.gather(cw_tensor, yb),
             )
+    else:
+        @nag
+        def _to_features(xb: tf.Tensor, yb: tf.Tensor):
+            return _featurize(xb), tf.one_hot(yb, n_classes, dtype=tf.float32)
 
     combined = combined.map(
         _to_features, num_parallel_calls=tf.data.AUTOTUNE
     ).prefetch(PREFETCH_BUFFER)
-    return combined, DatasetMeta(n_each=int(n_each), n_classes=n_classes)
+    return combined, DatasetMeta(
+        epoch_samples=int(total_samples),
+        n_classes=n_classes,
+        class_weights=class_weights if weighted else None,
+    )
 
 
 def _collect_predictions(
@@ -575,7 +564,7 @@ def run_experiments(
                 rng,
                 split="val",
                 input_repr=input_repr,
-                augment=None,
+                augment=False,
                 extra_other_idxs=extra_other_idxs,
             )
             test_ds, _ = _build_dataset_from_catalog(
@@ -586,11 +575,12 @@ def run_experiments(
                 rng,
                 split="test",
                 input_repr=input_repr,
-                augment=None,
+                augment=False,
                 extra_other_idxs=extra_other_idxs,
             )
             print(
-                f"[{run_type}] training_samples={meta.n_each} n_classes={meta.n_classes}"
+                f"[{run_type}] training_samples={meta.epoch_samples} "
+                f"n_classes={meta.n_classes} class_weights={meta.class_weights}"
             )
 
             model = model_builder(meta.n_classes)
