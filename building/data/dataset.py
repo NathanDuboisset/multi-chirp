@@ -29,13 +29,28 @@ SPLIT_NAMES = ("training", "validation", "testing")
 SPLIT_RATIOS = (0.7, 0.15, 0.15)
 SPLIT_SEED = 42
 
-# Clips from the same XC recording must stay in the same split.
+# Clips from the same recording must stay in the same split, across all sources:
+#   XenoCanto:  [<species>__]XC<id>_<window>.wav        -> group on XC<id>
+#   Macaulay:   [<species>__]ML<id>_<window>.wav        -> group on ML<id>
+#   AudioSet:   <ytid>.wav  or  <ytid>_<offset>.wav     -> group on YT<ytid>
+# YouTube IDs are exactly 11 chars from [A-Za-z0-9_-].
 _XC_GROUP_RE = re.compile(r"(?:^|__)(XC\d+)_")
+_ML_GROUP_RE = re.compile(r"(?:^|__)(ML\d+)_")
+_AS_GROUP_RE = re.compile(r"^([A-Za-z0-9_-]{11})(?:_\d+)?$")
 
 
 def group_key(clip_path: Path) -> str:
-    m = _XC_GROUP_RE.search(clip_path.name)
-    return m.group(1) if m else clip_path.name
+    name = clip_path.name
+    m = _XC_GROUP_RE.search(name)
+    if m:
+        return m.group(1)
+    m = _ML_GROUP_RE.search(name)
+    if m:
+        return m.group(1)
+    m = _AS_GROUP_RE.match(clip_path.stem)
+    if m:
+        return f"YT{m.group(1)}"
+    return name
 
 
 def audioset_round_robin() -> list[Path]:
