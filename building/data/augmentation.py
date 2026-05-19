@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
+import pyrootutils
 from audiomentations import (
     AddBackgroundNoise,
     AddGaussianNoise,
@@ -19,9 +18,14 @@ from audiomentations import (
     TimeMask,
 )
 
-from building.download import TARGET_SAMPLE_RATE
+from .download import TARGET_SAMPLE_RATE
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = pyrootutils.setup_root(
+    search_from=__file__,
+    indicator="pyproject.toml",
+    pythonpath=True,
+    dotenv=True,
+)
 AUDIOSET_DIR = ROOT / "raw_dataset" / "audioset"
 
 P_SHIFT = 0.5

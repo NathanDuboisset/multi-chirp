@@ -21,7 +21,7 @@ from xenocanto3 import (
     XenoCantoClient,
 )
 
-from building.taxonomy import MINIMUM_QUALITY
+from .taxonomy import MINIMUM_QUALITY
 
 
 @dataclass

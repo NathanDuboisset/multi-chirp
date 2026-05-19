@@ -60,16 +60,27 @@ def audioset_round_robin() -> list[Path]:
             return out
 
 
-def balanced_non_target(other_species_folders: list[Path]) -> list[Path]:
+def balanced_non_target(
+    other_species_folders: list[Path],
+    per_species_cap: int | None = None,
+) -> list[Path]:
     """Build the non_target pool: 50/50 audioset + xc_other, plus all
     birdnet-no-bird on top. The audioset and xc_other buckets are each
     capped at the size of the smaller of the two so they contribute equally;
     birdnet-no-bird is taken in full since it's a small, distinct source.
+
+    ``per_species_cap`` (optional) caps each other-species folder's
+    contribution to the xc_other pool *before* pooling, so a single
+    species with disproportionately many on-disk clips (e.g. because it
+    was downloaded as a target in another collection) can't dominate.
     """
     audioset_pool = audioset_round_robin()
     other_pool: list[Path] = []
     for folder in other_species_folders:
-        other_pool.extend(sorted(folder.glob("*.wav")))
+        clips = sorted(folder.glob("*.wav"))
+        if per_species_cap is not None:
+            clips = clips[:per_species_cap]
+        other_pool.extend(clips)
     no_bird_pool = (
         sorted(BIRDNET_NO_BIRD_DIR.glob("*.wav"))
         if BIRDNET_NO_BIRD_DIR.exists()
@@ -81,9 +92,11 @@ def balanced_non_target(other_species_folders: list[Path]) -> list[Path]:
     out.extend(audioset_pool[:n_each])
     out.extend(other_pool[:n_each])
     out.extend(no_bird_pool)
+    cap_note = f" (per-species cap={per_species_cap})" if per_species_cap is not None else ""
     print(
         f"Non-target pool: {len(out)} clips "
         f"({n_each} audioset + {n_each} xc_other + {len(no_bird_pool)} birdnet_no_bird)"
+        f"{cap_note}"
     )
     print(f"  audioset:         take {n_each} of {len(audioset_pool)} available")
     print(f"  xc_other:         take {n_each} of {len(other_pool)} available")
@@ -115,6 +128,7 @@ def build_task_dataset(
     collection_name: str,
     target_species: list[str],
     non_target_species: list[str],
+    non_target_per_species_cap: int | None = None,
 ) -> Path:
     dataset_root = DATASETS_DIR / collection_name
     for s in SPLIT_NAMES:
@@ -129,9 +143,81 @@ def build_task_dataset(
     non_target_folders = [
         SUBSAMPLES_DIR / n.replace(" ", "_") for n in non_target_species
     ]
-    non_target = balanced_non_target(other_species_folders=non_target_folders)
+    non_target = balanced_non_target(
+        other_species_folders=non_target_folders,
+        per_species_cap=non_target_per_species_cap,
+    )
     if non_target:
         class_to_clips["non_target"] = non_target
+
+    rng = random.Random(SPLIT_SEED)
+    for folder, all_clips in class_to_clips.items():
+        print(f"Processing {folder} with {len(all_clips)} clips")
+        buckets = split_class(all_clips, rng)
+        print(
+            f"Training: {len(buckets['training'])}, "
+            f"Validation: {len(buckets['validation'])}, "
+            f"Testing: {len(buckets['testing'])}"
+        )
+        for split_name in SPLIT_NAMES:
+            files = buckets[split_name]
+            dest = dataset_root / split_name / folder
+            dest.mkdir(parents=True, exist_ok=True)
+            for i, file_path in enumerate(files):
+                target = dest / f"{split_name}_{i}.wav"
+                if not target.exists():
+                    target.symlink_to(file_path.resolve())
+            print(f"Copied {len(files)} clips from {folder} to {split_name}")
+
+    return dataset_root
+
+
+def build_cascading_dataset(
+    collection_name: str,
+    target_species: list[str],
+    non_target_species: list[str],
+) -> Path:
+    """Variant of `build_task_dataset` that keeps "bird" and "no-bird"
+    negatives in separate folders so a cascading pipeline can train a
+    binary bird detector and a bird-only classifier from the same
+    on-disk collection.
+
+    Produced layout under ``datasets/<collection_name>/<split>/``:
+      ``<target_species_i>``  — one folder per target species (as-is)
+      ``non_target_bird``     — other-bird species pooled (XC/eBird only)
+      ``no_bird``             — AudioSet ambient + BirdNET no-bird pooled
+    """
+    dataset_root = DATASETS_DIR / collection_name
+    for s in SPLIT_NAMES:
+        (dataset_root / s).mkdir(parents=True, exist_ok=True)
+
+    class_to_clips: dict[str, list[Path]] = {}
+    for name in target_species:
+        folder = name.replace(" ", "_")
+        clips = sorted((SUBSAMPLES_DIR / folder).glob("*.wav"))
+        class_to_clips[folder] = clips
+
+    non_target_bird: list[Path] = []
+    for sp in non_target_species:
+        folder = SUBSAMPLES_DIR / sp.replace(" ", "_")
+        if folder.exists():
+            non_target_bird.extend(sorted(folder.glob("*.wav")))
+    if non_target_bird:
+        class_to_clips["non_target_bird"] = non_target_bird
+
+    no_bird = audioset_round_robin() + (
+        sorted(BIRDNET_NO_BIRD_DIR.glob("*.wav"))
+        if BIRDNET_NO_BIRD_DIR.exists()
+        else []
+    )
+    if no_bird:
+        class_to_clips["no_bird"] = no_bird
+
+    print(
+        f"Cascading pools: non_target_bird={len(non_target_bird)} "
+        f"no_bird={len(no_bird)} "
+        f"(audioset_round_robin + birdnet_no_bird)"
+    )
 
     rng = random.Random(SPLIT_SEED)
     for folder, all_clips in class_to_clips.items():

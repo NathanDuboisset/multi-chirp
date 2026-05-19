@@ -27,7 +27,7 @@ from birdnetlib.analyzer import Analyzer as ModelAnalyzer
 from dotenv import load_dotenv
 from tqdm.auto import tqdm
 
-from building.sources import RecordingEntry, Source
+from .sources import RecordingEntry, Source
 
 ROOT = pyrootutils.setup_root(
     search_from=__file__,
@@ -53,7 +53,9 @@ POOL_SIZE = 10
 _analyzers: dict[int, ModelAnalyzer] = {}
 _analyzers_lock = threading.Lock()
 _stderr_lock = threading.Lock()
-_clip_indices: dict[str, int] = {}
+# Keyed by (species_key, source.prefix) for per-species clip counters, and by
+# plain str for the shared non-target buckets ("non_target_other", ...).
+_clip_indices: dict[object, int] = {}
 _nt_lock = threading.Lock()
 
 
@@ -91,7 +93,7 @@ def get_analyzer() -> ModelAnalyzer:
     return _analyzers[tid]
 
 
-def next_idx(key: str, directory: Path) -> int:
+def next_idx(key: object, directory: Path) -> int:
     if key not in _clip_indices:
         _clip_indices[key] = (
             max(
@@ -167,12 +169,15 @@ async def fetch_listing(source: Source, scientific_name: str) -> list[RecordingE
 
 async def download_species_one_source(
     scientific_name: str,
-    clips_per_species: int,
+    target_from_source: int,
     source: Source,
+    *,
+    position_base: int = 0,
 ) -> None:
-    """Drive `source` until `species_dir` has `clips_per_species` total wavs
-    (across all source prefixes). Idempotent: the listing CSV and the
-    per-species processed.csv let reruns pick up where a previous run stopped.
+    """Drive `source` until `species_dir` holds `target_from_source` clips
+    *for this source's prefix*. Idempotent across reruns and safe to run
+    concurrently with other sources for the same species: per-source state
+    (clip index counter, processed.csv) is keyed by source prefix/name.
     """
     species_key = scientific_name.replace(" ", "_")
     target_lower = scientific_name.lower()
@@ -181,14 +186,15 @@ async def download_species_one_source(
     raw_dir = SPECIES_DIR / species_key
     for d in (species_dir, raw_dir, NON_TARGET_OTHER_DIR, BIRDNET_NO_BIRD_DIR):
         d.mkdir(parents=True, exist_ok=True)
-    processed_csv = LISTINGS_DIR / "processed" / f"{species_key}.csv"
+    processed_csv = LISTINGS_DIR / "processed" / source.name / f"{species_key}.csv"
     processed_csv.parent.mkdir(parents=True, exist_ok=True)
 
     tag = f"[{scientific_name} / {source.name}]"
+    idx_key = (species_key, source.prefix)
 
-    clip_count = sum(1 for _ in species_dir.glob("*.wav"))
-    if clip_count >= clips_per_species:
-        print(f"{tag} {clip_count}/{clips_per_species} clips already on disk, skipping.")
+    clip_count = sum(1 for _ in species_dir.glob(f"{source.prefix}*.wav"))
+    if clip_count >= target_from_source:
+        print(f"{tag} {clip_count}/{target_from_source} clips already on disk, skipping.")
         return
 
     available = await fetch_listing(source, scientific_name)
@@ -202,27 +208,27 @@ async def download_species_one_source(
         processed = set()
     pending = [r for r in available if r.filename not in processed]
     random.shuffle(pending)
-    pending = pending[: clips_per_species - clip_count]
+    pending = pending[: target_from_source - clip_count]
     if not pending:
         print(
             f"{tag} no pending recordings "
             f"(available={len(available)}, already processed={len(processed)}, "
-            f"on disk={clip_count}/{clips_per_species})."
+            f"on disk={clip_count}/{target_from_source})."
         )
         return
 
     print(
-        f"{tag} {clip_count}/{clips_per_species} on disk; "
+        f"{tag} {clip_count}/{target_from_source} on disk; "
         f"queued {len(pending)} of {len(available)} available."
     )
 
-    _clip_indices[species_key] = clip_count
+    _clip_indices[idx_key] = clip_count
     species_lock = threading.Lock()
 
     def handle(entry: RecordingEntry) -> int:
         nonlocal clip_count
         with species_lock:
-            if clip_count >= clips_per_species:
+            if clip_count >= target_from_source:
                 return 0
 
         rec_id = entry.rec_id
@@ -251,19 +257,19 @@ async def download_species_one_source(
 
             with species_lock:
                 for det in target_dets:
-                    if clip_count >= clips_per_species:
+                    if clip_count >= target_from_source:
                         break
-                    idx = _clip_indices[species_key]
+                    idx = _clip_indices[idx_key]
                     if write_clip(
                         audio_path,
                         float(det.get("start_time", 0.0)),
                         species_dir / f"{source.prefix}{rec_id}_{idx:05d}.wav",
                     ):
-                        _clip_indices[species_key] += 1
+                        _clip_indices[idx_key] += 1
                         clip_count += 1
                         clips_written += 1
-                        if clip_count == clips_per_species:
-                            print(f"{tag} reached {clips_per_species} clips.")
+                        if clip_count == target_from_source:
+                            print(f"{tag} reached {target_from_source} clips.")
 
             with _nt_lock:
                 if other_dets:
@@ -332,13 +338,16 @@ async def download_species_one_source(
     dl_last = [0.0]
     dl_interval = source.dl_interval
     pbar_recs = tqdm(
-        total=len(pending), desc=f"[{scientific_name}] recs", position=0, leave=True
+        total=len(pending),
+        desc=f"[{scientific_name}/{source.name}] recs",
+        position=position_base,
+        leave=True,
     )
     pbar_clips = tqdm(
-        total=clips_per_species,
+        total=target_from_source,
         initial=clip_count,
-        desc=f"[{scientific_name}] clips",
-        position=1,
+        desc=f"[{scientific_name}/{source.name}] clips",
+        position=position_base + 1,
         leave=True,
     )
 
@@ -374,12 +383,13 @@ async def download_and_process(
     target is `per_source_clips * len(sources)`. The orchestration runs in
     two phases:
 
-      A. For each source in order, raise the species' clip count by up to
-         `per_source_clips` new clips from that source.
-      B. If the global target still isn't met (some source ran out of
-         recordings), iterate the sources again and let any of them top up
-         to the global target. Per-source `processed.csv` filtering means
-         no recording is attempted twice.
+      A. All sources run in parallel, each raising its own clip count up to
+         `per_source_clips`. Sources are independent — separate listings,
+         separate processed.csv, separate clip-index counters keyed by
+         prefix — so concurrent runs don't race on shared state.
+      B. If the global target still isn't met (a source ran out of
+         recordings), iterate the sources sequentially and let any of them
+         extend past their per-source quota to cover the shortfall.
     """
     if not sources:
         raise ValueError("download_and_process: need at least one source")
@@ -414,34 +424,29 @@ async def download_and_process(
         print(f"[{scientific_name}] already at target, nothing to do.")
         return
 
-    async def _try_one_source(src: Source, cap: int, phase: str) -> None:
+    async def _try_one_source(
+        src: Source, target_for_src: int, phase: str, position_base: int = 0
+    ) -> None:
         # Per-source failures (missing taxonomy code, listing API hiccup,
         # auth error, ...) should never abort the outer species loop —
         # log and move on so the rest of the batch still runs.
         try:
-            await download_species_one_source(scientific_name, cap, src)
+            await download_species_one_source(
+                scientific_name, target_for_src, src, position_base=position_base
+            )
         except Exception as e:
             print(
                 f"[{scientific_name} / {src.name}] {phase} failed: "
                 f"{type(e).__name__}: {e}"
             )
 
-    print(f"[{scientific_name}] --- Phase A: per-source quota ---")
-    for src in sources:
-        already_from_src = count_from(src)
-        if already_from_src >= per_source_clips:
-            print(
-                f"[{scientific_name} / {src.name}] "
-                f"{already_from_src}/{per_source_clips} already on disk from this "
-                f"source, skipping Phase A."
-            )
-            continue
-        # Per-source cap: bring this source's contribution up to
-        # per_source_clips. The function counts total clips for its stop
-        # condition, so we pass current_total + remaining-needed-from-this-src.
-        needed = per_source_clips - already_from_src
-        cap = min(current_total() + needed, total_target)
-        await _try_one_source(src, cap, "Phase A")
+    print(f"[{scientific_name}] --- Phase A: per-source quota (parallel) ---")
+    await asyncio.gather(
+        *[
+            _try_one_source(src, per_source_clips, "Phase A", position_base=i * 2)
+            for i, src in enumerate(sources)
+        ]
+    )
 
     if current_total() < total_target:
         print(
@@ -449,9 +454,12 @@ async def download_and_process(
             f"(have {current_total()}/{total_target}) ---"
         )
         for src in sources:
-            if current_total() >= total_target:
+            shortfall = total_target - current_total()
+            if shortfall <= 0:
                 break
-            await _try_one_source(src, total_target, "Phase B")
+            # Let this source extend past its per-source quota to absorb
+            # what other sources couldn't supply.
+            await _try_one_source(src, count_from(src) + shortfall, "Phase B")
 
     per_source_summary = ", ".join(f"{s.name}={count_from(s)}" for s in sources)
     print(

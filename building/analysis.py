@@ -19,13 +19,13 @@ from folium.plugins import HeatMap
 from tqdm.auto import tqdm
 from xenocanto3 import AsyncXenoCantoClient, Group, Quality, Recording
 
-from building.download import (
+from building.data.download import (
     BIRDNET_THRESHOLD,
     POOL_SIZE,
     get_analyzer,
     quiet,
 )
-from building.taxonomy import MINIMUM_QUALITY
+from building.data.taxonomy import MINIMUM_QUALITY
 
 XC_DL_INTERVAL = 0.2  # seconds between successive XC downloads (rate limit)
 
@@ -159,7 +159,7 @@ def build_heatmap(
 def _load_taxonomy() -> pd.DataFrame:
     if not TAXONOMY_FILE.exists():
         raise FileNotFoundError(
-            f"Missing {TAXONOMY_FILE}. Run anything from building.taxonomy first to cache it."
+            f"Missing {TAXONOMY_FILE}. Run anything from building.data.taxonomy first to cache it."
         )
     df = pd.read_csv(TAXONOMY_FILE)
     df = df[df["CATEGORY"] == "species"][["ORDER", "FAMILY", "SCI_NAME"]].copy()

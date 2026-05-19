@@ -21,7 +21,7 @@ import soundfile as sf
 from pydantic import BaseModel, ConfigDict
 from tqdm.auto import tqdm
 
-from building.download import CLIP_DURATION, RAW_DATASET_DIR, TARGET_SAMPLE_RATE
+from .download import CLIP_DURATION, RAW_DATASET_DIR, TARGET_SAMPLE_RATE
 
 ROOT = pyrootutils.setup_root(
     search_from=__file__,
