@@ -27,6 +27,7 @@ dependencies = [
   "folium>=0.16",
   "ebird-api>=4.0.0",
   "audiomentations>=0.43.1",
+  "dropbox>=12.0.2",
 ]
 
 [build-system]

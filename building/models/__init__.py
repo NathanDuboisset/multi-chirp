@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Callable, Literal, NamedTuple
 if TYPE_CHECKING:
     from keras import Model
 
-from building.models import cnn1d, leaf, mel_cnn, sincnet
+from building.models import bake, cnn1d, leaf, mel_cnn, model_eval, sincnet
 from building.models._common import (
     MEL_INPUT_SHAPE,
     NUM_MEL_BINS,
@@ -63,4 +63,6 @@ __all__ = [
     "available_models",
     "build_model",
     "input_repr_for",
+    "bake",
+    "model_eval",
 ]
