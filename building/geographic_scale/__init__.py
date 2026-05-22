@@ -8,10 +8,26 @@ The on-disk dataset / models / results folders are slug-named so the
 
 from __future__ import annotations
 
-from building.geographic_task import task_slug as _task_slug
+import re
+
+from .dataset_info import DatasetInfo, info_path, load_dataset_info, write_dataset_info
+
+__all__ = [
+    "place_slug",
+    "DatasetInfo",
+    "info_path",
+    "load_dataset_info",
+    "write_dataset_info",
+]
 
 
-def scale_slug(
-    lat: float, lon: float, radius_km: float, n_targets: int = 10
-) -> str:
-    return _task_slug([None] * n_targets, lat, lon, radius_km, prefix="scale")
+def place_slug(place_name: str, n_targets: int) -> str:
+    """Build a dataset collection name from a place + target-count.
+
+    ``place_slug("Paris", 10) -> "paris_10"``. Lowercased, non-alnum runs
+    collapsed to ``_``. The slug is the single source of truth — the place
+    coordinates / radius live in ``dataset.json`` so notebooks don't have to
+    redefine them.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "_", place_name.lower()).strip("_")
+    return f"{slug}_{n_targets}"

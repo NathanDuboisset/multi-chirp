@@ -25,6 +25,8 @@ from building.training import (
     model_factory,
 )
 
+NON_TARGET_NAME = "non_target"
+
 class ScalingRunConfig(BaseModel):
     collection: str
     build_model: str
@@ -51,11 +53,27 @@ class BaseRunResult(BaseModel):
     config: dict[str, Any]
 
 
+class QuantStats(BaseModel):
+    model_size_kb: float
+    arena_size_kb: float | None = None
+    flops_mflops: float
+    input_dtype: str
+    output_dtype: str
+    input_shape: list[int]
+    tflite_path: str
+
+
 class BaselineRunResult(BaseRunResult):
     run_type: Literal["baseline"]
     target_class: str
     target_idx: int
     metrics: RunMetrics
+    # New fields — optional so old rows keep parsing.
+    label_names: list[str] | None = None
+    float_metrics: RunMetrics | None = None
+    quant_stats: QuantStats | None = None
+    tflite_path: str | None = None
+    npz_path: str | None = None
 
 
 class ScalingResult(BaseRunResult):
@@ -68,6 +86,12 @@ class ScalingResult(BaseRunResult):
     extra_other_indices: list[int] = []
     extra_other_classes: list[str] = []
     metrics: RunMetrics
+    # New fields — optional so old rows keep parsing.
+    label_names: list[str] | None = None
+    float_metrics: RunMetrics | None = None
+    quant_stats: QuantStats | None = None
+    tflite_path: str | None = None
+    npz_path: str | None = None
 
 
 RunResult = Annotated[
@@ -187,8 +211,10 @@ def run_experiments(
                 ],
             )
             test_loss = float(model.evaluate(test_ds, verbose=0)[0])  # ty:ignore[not-subscriptable]
-            y_true, y_pred = collect_predictions(model, test_ds)
-            m = compute_metrics(y_true, y_pred, config.threshold, test_loss)
+
+            # Label names match build_dataset_from_catalog: chosen classes first,
+            # then "non_target" (which folds non_target + any extra_other_idxs).
+            label_names = [catalog.class_names[i] for i in chosen_idxs] + [NON_TARGET_NAME]
 
             model_path = (
                 config.models_dir
@@ -198,6 +224,66 @@ def run_experiments(
             model_path.parent.mkdir(parents=True, exist_ok=True)
             model.save(model_path)
 
+            # Post-training quantization + side-by-side float/INT8 evaluation.
+            from building.models import model_eval as M
+            from building.models.bake import bake_model
+            from building import results_io as R
+
+            tflite_path = model_path.with_suffix(".tflite")
+            tflite_stats = bake_model(
+                model, val_ds, tflite_path, n_representative=100, verbose=False
+            )
+            cmp = M.compare_float_vs_quantized(
+                model, tflite_path, test_ds, label_names,
+                threshold=config.threshold, threshold_mode="fixed",
+                non_target_names=[NON_TARGET_NAME],
+            )
+            y_true_float = cmp.float_eval.y_true
+            y_pred_float = cmp.float_eval.y_score
+            y_pred_quant = cmp.quant_eval.y_score
+
+            # Quantized BCE — keep the deployment reality as the canonical "loss".
+            quant_loss = float(
+                tf.keras.losses.BinaryCrossentropy()(y_true_float, y_pred_quant).numpy()
+            )
+
+            m = compute_metrics(
+                y_true_float, y_pred_quant, config.threshold, quant_loss,
+                class_names=label_names, non_target_names=[NON_TARGET_NAME],
+            )
+            float_m = compute_metrics(
+                y_true_float, y_pred_float, config.threshold, test_loss,
+                class_names=label_names, non_target_names=[NON_TARGET_NAME],
+            )
+
+            npz_dir = config.results_file.parent / "arrays"
+            npz_dir.mkdir(parents=True, exist_ok=True)
+            npz_key = (
+                f"baseline_{extra.get('target_idx')}"
+                if run_type == "baseline"
+                else f"scaling_k{extra.get('k')}_s{extra.get('sample_idx')}_{'_'.join(str(i) for i in chosen_idxs)}"
+            )
+            npz_path = npz_dir / f"{npz_key}.npz"
+            np.savez_compressed(
+                npz_path,
+                **R.build_arrays_npz(
+                    float_eval=cmp.float_eval, quant_eval=cmp.quant_eval
+                ),
+            )
+
+            quant_stats = QuantStats(
+                model_size_kb=float(tflite_stats.model_size_kb),
+                arena_size_kb=(
+                    None if tflite_stats.arena_size_kb is None
+                    else float(tflite_stats.arena_size_kb)
+                ),
+                flops_mflops=float(tflite_stats.flops_mflops),
+                input_dtype=tflite_stats.input_dtype,
+                output_dtype=tflite_stats.output_dtype,
+                input_shape=list(tflite_stats.input_shape),
+                tflite_path=str(tflite_path),
+            )
+
             common: dict[str, Any] = {
                 "collection": config.collection,
                 "build_model": config.build_model,
@@ -205,6 +291,11 @@ def run_experiments(
                 "model_path": str(model_path),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "config": config.model_dump(mode="json"),
+                "label_names": label_names,
+                "float_metrics": float_m,
+                "quant_stats": quant_stats,
+                "tflite_path": str(tflite_path),
+                "npz_path": str(npz_path),
                 **extra,
             }
             res_cls = BaselineRunResult if run_type == "baseline" else ScalingResult

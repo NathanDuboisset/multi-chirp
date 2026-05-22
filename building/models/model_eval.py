@@ -15,12 +15,12 @@ loader and produces the float→INT8 drop table and bar chart, matching the
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Literal
 
 import numpy as np
 import tensorflow as tf
+from pydantic import BaseModel, ConfigDict, Field
 
 if TYPE_CHECKING:
     import keras
@@ -102,8 +102,7 @@ def _predict_tflite(
 # Metrics
 
 
-@dataclass
-class PerClassMetrics:
+class PerClassMetrics(BaseModel):
     name: str
     threshold: float
     support: int
@@ -114,8 +113,12 @@ class PerClassMetrics:
     auc: float | None = None
 
 
-@dataclass
-class EvalResult:
+class EvalResult(BaseModel):
+    """Per-backend evaluation summary + raw scores. Pydantic over dataclass so
+    autoreload picks up new fields without a kernel restart."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     backend: Backend
     label_names: list[str]
     per_class: dict[str, PerClassMetrics]
@@ -129,9 +132,116 @@ class EvalResult:
     confusion: np.ndarray  # [true_top1, pred_top1]
     avg_inference_ms: float
     threshold_mode: ThresholdMode
+    non_target_names: tuple[str, ...] = ()
+    # Macros computed over target species only (label_names minus non_target_names).
+    macro_precision_targets: float | None = None
+    macro_recall_targets: float | None = None
+    macro_f1_targets: float | None = None
+    macro_f2_targets: float | None = None
+    macro_auc_targets: float | None = None
     tflite_stats: TFLiteStats | None = None
-    y_true: np.ndarray = field(repr=False, default=None)  # type: ignore[assignment]
-    y_score: np.ndarray = field(repr=False, default=None)  # type: ignore[assignment]
+    y_true: np.ndarray | None = Field(default=None, repr=False)
+    y_score: np.ndarray | None = Field(default=None, repr=False)
+
+
+def macro_targets(
+    per_class: dict[str, PerClassMetrics],
+    non_target_names: Iterable[str],
+) -> dict[str, float | None]:
+    """Mean of per-class metrics restricted to target classes (not in non_target_names).
+
+    Returns {'precision', 'recall', 'f1', 'f2', 'auc'}. AUC is None if any
+    included class has AUC None (e.g. constant labels).
+    """
+    excluded = set(non_target_names)
+    targets = [m for name, m in per_class.items() if name not in excluded]
+    if not targets:
+        return {"precision": None, "recall": None, "f1": None, "f2": None, "auc": None}
+    aucs = [m.auc for m in targets]
+    return {
+        "precision": float(np.mean([m.precision for m in targets])),
+        "recall": float(np.mean([m.recall for m in targets])),
+        "f1": float(np.mean([m.f1 for m in targets])),
+        "f2": float(np.mean([m.f2 for m in targets])),
+        "auc": (
+            float(np.mean(aucs)) if all(a is not None for a in aucs) else None
+        ),
+    }
+
+
+def threshold_curve(
+    y_true_c: np.ndarray,
+    y_score_c: np.ndarray,
+    thresholds: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Per-class metric-vs-threshold sweep.
+
+    Returns dict of arrays of shape (len(thresholds),) for:
+    threshold, precision, recall, f1, f2, accuracy.
+    """
+    yt = (np.asarray(y_true_c) >= 0.5).astype(int)
+    ys = np.asarray(y_score_c)
+    thr = np.asarray(thresholds, dtype=float)
+
+    n = yt.size
+    precs = np.empty_like(thr)
+    recs = np.empty_like(thr)
+    f1s = np.empty_like(thr)
+    f2s = np.empty_like(thr)
+    accs = np.empty_like(thr)
+    pos = int(yt.sum())
+    neg = n - pos
+    for i, t in enumerate(thr):
+        yp = (ys >= t).astype(int)
+        tp = int(((yp == 1) & (yt == 1)).sum())
+        fp = int(((yp == 1) & (yt == 0)).sum())
+        fn = pos - tp
+        tn = neg - fp
+        p = tp / (tp + fp) if (tp + fp) else 0.0
+        r = tp / (tp + fn) if (tp + fn) else 0.0
+        f1 = 2 * p * r / (p + r) if (p + r) else 0.0
+        d2 = 4 * p + r
+        f2 = 5 * p * r / d2 if d2 else 0.0
+        precs[i] = p
+        recs[i] = r
+        f1s[i] = f1
+        f2s[i] = f2
+        accs[i] = (tp + tn) / n if n else 0.0
+    return {
+        "threshold": thr,
+        "precision": precs,
+        "recall": recs,
+        "f1": f1s,
+        "f2": f2s,
+        "accuracy": accs,
+    }
+
+
+def roc_arrays(
+    y_true_c: np.ndarray, y_score_c: np.ndarray
+) -> dict[str, np.ndarray | float | None]:
+    """Per-class ROC: {'fpr', 'tpr', 'thresholds', 'auc'}.
+
+    AUC is None when the class is degenerate (all-positive or all-negative).
+    """
+    from sklearn.metrics import roc_auc_score, roc_curve
+
+    yt = (np.asarray(y_true_c) >= 0.5).astype(int)
+    ys = np.asarray(y_score_c)
+    if yt.sum() == 0 or yt.sum() == yt.size:
+        return {
+            "fpr": np.array([0.0, 1.0]),
+            "tpr": np.array([0.0, 1.0]),
+            "thresholds": np.array([np.inf, -np.inf]),
+            "auc": None,
+        }
+    fpr, tpr, thr = roc_curve(yt, ys)
+    return {
+        "fpr": fpr,
+        "tpr": tpr,
+        "thresholds": thr,
+        "auc": float(roc_auc_score(yt, ys)),
+    }
 
 
 def _best_threshold(
@@ -237,6 +347,128 @@ def _confusion_top1(y_true: np.ndarray, y_score: np.ndarray, k: int) -> np.ndarr
     return cm
 
 
+def _eval_from_scores(
+    *,
+    backend: Backend,
+    label_names: list[str],
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    thresholds: np.ndarray,
+    avg_inference_ms: float,
+    threshold_mode: ThresholdMode,
+    non_target_names: Iterable[str] = (),
+    tflite_stats: TFLiteStats | None = None,
+) -> EvalResult:
+    """Wrap pre-computed predictions in an EvalResult.
+
+    Shared between `evaluate()` and the cascade orchestration in
+    `eval_result_from_predictions()`.
+    """
+    per_class, macro_auc = _per_class_metrics(
+        y_true, y_score, label_names, thresholds
+    )
+
+    precisions = [m.precision for m in per_class.values()]
+    recalls = [m.recall for m in per_class.values()]
+    f1s = [m.f1 for m in per_class.values()]
+    f2s = [m.f2 for m in per_class.values()]
+
+    yt_top1 = np.argmax(y_true, axis=1)
+    yp_top1 = np.argmax(y_score, axis=1)
+    top1 = float(np.mean(yt_top1 == yp_top1))
+
+    yt_bin = (y_true >= 0.5).astype(int)
+    yp_bin = (y_score >= thresholds[None, :]).astype(int)
+    subset = float(np.mean(np.all(yt_bin == yp_bin, axis=1)))
+
+    cm = _confusion_top1(y_true, y_score, len(label_names))
+
+    nt_tuple = tuple(non_target_names)
+    if nt_tuple:
+        mt = macro_targets(per_class, nt_tuple)
+    else:
+        mt = {"precision": None, "recall": None, "f1": None, "f2": None, "auc": None}
+
+    return EvalResult(
+        backend=backend,
+        label_names=list(label_names),
+        per_class=per_class,
+        macro_precision=float(np.mean(precisions)),
+        macro_recall=float(np.mean(recalls)),
+        macro_f1=float(np.mean(f1s)),
+        macro_f2=float(np.mean(f2s)),
+        macro_auc=macro_auc,
+        top1_accuracy=top1,
+        subset_accuracy=subset,
+        confusion=cm,
+        avg_inference_ms=avg_inference_ms,
+        threshold_mode=threshold_mode,
+        non_target_names=nt_tuple,
+        macro_precision_targets=mt["precision"],
+        macro_recall_targets=mt["recall"],
+        macro_f1_targets=mt["f1"],
+        macro_f2_targets=mt["f2"],
+        macro_auc_targets=mt["auc"],
+        tflite_stats=tflite_stats,
+        y_true=y_true,
+        y_score=y_score,
+    )
+
+
+def predict_via_tflite(
+    tflite_path: Path | str, ds: tf.data.Dataset
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Public wrapper around the internal int8 inference loop.
+
+    Used by cascade composition: get the same dequantized probabilities the
+    evaluator sees, but without running the full evaluate() pipeline.
+    """
+    return _predict_tflite(Path(tflite_path), ds)
+
+
+def eval_result_from_predictions(
+    *,
+    backend: Backend,
+    label_names: list[str],
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    threshold: float | np.ndarray = 0.5,
+    threshold_mode: ThresholdMode = "fixed",
+    threshold_tuning: tuple[np.ndarray, np.ndarray] | None = None,
+    non_target_names: Iterable[str] = (),
+    avg_inference_ms: float = 0.0,
+    tflite_stats: TFLiteStats | None = None,
+) -> EvalResult:
+    """Build an EvalResult from already-computed predictions.
+
+    Lets the cascade orchestrate stage-1 + stage-2 inference in numpy then
+    reuse the same metric machinery as the single-model path.
+    """
+    if threshold_mode == "fixed":
+        thresholds = _resolve_thresholds(
+            y_true, y_score, label_names, threshold, "fixed"
+        )
+    else:
+        if threshold_tuning is None:
+            tune_y_true, tune_y_score = y_true, y_score
+        else:
+            tune_y_true, tune_y_score = threshold_tuning
+        thresholds = _resolve_thresholds(
+            tune_y_true, tune_y_score, label_names, threshold, threshold_mode
+        )
+    return _eval_from_scores(
+        backend=backend,
+        label_names=list(label_names),
+        y_true=np.asarray(y_true),
+        y_score=np.asarray(y_score),
+        thresholds=thresholds,
+        avg_inference_ms=avg_inference_ms,
+        threshold_mode=threshold_mode,
+        non_target_names=non_target_names,
+        tflite_stats=tflite_stats,
+    )
+
+
 def evaluate(
     model_or_path: "keras.Model | str | Path",
     test_ds: tf.data.Dataset,
@@ -245,6 +477,7 @@ def evaluate(
     threshold: float | np.ndarray = 0.5,
     threshold_mode: ThresholdMode = "fixed",
     threshold_tuning_ds: tf.data.Dataset | None = None,
+    non_target_names: Iterable[str] = (),
 ) -> EvalResult:
     """Run a model end-to-end and return a fully-populated `EvalResult`.
 
@@ -257,6 +490,9 @@ def evaluate(
       * `threshold_mode='best_f1' | 'best_f2'` derives thresholds from
         `threshold_tuning_ds` if given, otherwise from the test set (a known
         peek; warn-worthy if you care about strict generalization).
+
+    `non_target_names` populates the `macro_*_targets` fields on the result
+    by averaging only over species not in that set.
     """
     is_tflite = isinstance(model_or_path, (str, Path))
     backend: Backend = "tflite" if is_tflite else "keras"
@@ -287,44 +523,16 @@ def evaluate(
             tune_y_true, tune_y_score, label_names, threshold, threshold_mode
         )
 
-    per_class, macro_auc = _per_class_metrics(
-        y_true, y_score, label_names, thresholds
-    )
-
-    precisions = [m.precision for m in per_class.values()]
-    recalls = [m.recall for m in per_class.values()]
-    f1s = [m.f1 for m in per_class.values()]
-    f2s = [m.f2 for m in per_class.values()]
-
-    yt_top1 = np.argmax(y_true, axis=1)
-    yp_top1 = np.argmax(y_score, axis=1)
-    top1 = float(np.mean(yt_top1 == yp_top1))
-
-    # Subset accuracy under independent per-class thresholds: a sample is
-    # "right" iff every class's binary call matches the multi-hot label.
-    yt_bin = (y_true >= 0.5).astype(int)
-    yp_bin = (y_score >= thresholds[None, :]).astype(int)
-    subset = float(np.mean(np.all(yt_bin == yp_bin, axis=1)))
-
-    cm = _confusion_top1(y_true, y_score, len(label_names))
-
-    return EvalResult(
+    return _eval_from_scores(
         backend=backend,
         label_names=list(label_names),
-        per_class=per_class,
-        macro_precision=float(np.mean(precisions)),
-        macro_recall=float(np.mean(recalls)),
-        macro_f1=float(np.mean(f1s)),
-        macro_f2=float(np.mean(f2s)),
-        macro_auc=macro_auc,
-        top1_accuracy=top1,
-        subset_accuracy=subset,
-        confusion=cm,
-        avg_inference_ms=avg_ms,
-        threshold_mode=threshold_mode,
-        tflite_stats=tflite_stats,
         y_true=y_true,
         y_score=y_score,
+        thresholds=thresholds,
+        avg_inference_ms=avg_ms,
+        threshold_mode=threshold_mode,
+        non_target_names=non_target_names,
+        tflite_stats=tflite_stats,
     )
 
 
@@ -363,6 +571,13 @@ def summary(result: EvalResult) -> dict[str, Any]:
         "macro_auc": result.macro_auc,
         "avg_inference_ms": result.avg_inference_ms,
     }
+    if result.non_target_names:
+        s["non_target_names"] = list(result.non_target_names)
+        s["macro_precision_targets"] = result.macro_precision_targets
+        s["macro_recall_targets"] = result.macro_recall_targets
+        s["macro_f1_targets"] = result.macro_f1_targets
+        s["macro_f2_targets"] = result.macro_f2_targets
+        s["macro_auc_targets"] = result.macro_auc_targets
     if result.tflite_stats is not None:
         s["model_size_kb"] = result.tflite_stats.model_size_kb
         s["arena_size_kb"] = result.tflite_stats.arena_size_kb
@@ -393,20 +608,31 @@ def print_summary(result: EvalResult) -> None:
 # Threshold-selection plots
 
 
+def _display_classes(
+    result: EvalResult, classes: Iterable[str] | None, target_only: bool
+) -> list[str]:
+    """Resolve which classes to plot — explicit list wins, then target_only."""
+    if classes is not None:
+        return list(classes)
+    excluded = set(result.non_target_names) if target_only else set()
+    return [n for n in result.label_names if n not in excluded]
+
+
 def plot_threshold_sweep(
     result: EvalResult,
     beta: float = 2.0,
     classes: Iterable[str] | None = None,
+    target_only: bool = True,
 ) -> "matplotlib.figure.Figure":
     """Plot Fbeta vs threshold per class, marking the argmax.
 
-    Useful to *see* the threshold-selection step and confirm the chosen
-    operating point isn't on a narrow spike.
+    By default skips classes in `result.non_target_names`. Pass `target_only=False`
+    to include every class, or `classes=[...]` for an explicit subset.
     """
     import matplotlib.pyplot as plt
     from sklearn.metrics import precision_recall_curve
 
-    target = list(classes) if classes is not None else result.label_names
+    target = _display_classes(result, classes, target_only)
     fig, ax = plt.subplots(figsize=(8, 5))
     b2 = beta * beta
     for c, name in enumerate(result.label_names):
@@ -431,13 +657,23 @@ def plot_threshold_sweep(
     return fig
 
 
-def plot_roc(result: EvalResult) -> "matplotlib.figure.Figure":
-    """One ROC per class, log-x to highlight the low-FPR regime."""
+def plot_roc(
+    result: EvalResult,
+    classes: Iterable[str] | None = None,
+    target_only: bool = True,
+) -> "matplotlib.figure.Figure":
+    """One ROC per class, log-x to highlight the low-FPR regime.
+
+    Skips classes in `result.non_target_names` by default.
+    """
     import matplotlib.pyplot as plt
     from sklearn.metrics import roc_curve
 
+    target = _display_classes(result, classes, target_only)
     fig, ax = plt.subplots(figsize=(7, 5))
     for c, name in enumerate(result.label_names):
+        if name not in target:
+            continue
         yt = (result.y_true[:, c] >= 0.5).astype(int)
         if yt.sum() == 0 or yt.sum() == yt.size:
             continue
@@ -455,11 +691,48 @@ def plot_roc(result: EvalResult) -> "matplotlib.figure.Figure":
     return fig
 
 
+def plot_metric_sweep_panel(
+    result: EvalResult,
+    classes: Iterable[str] | None = None,
+    target_only: bool = True,
+    n_thresholds: int = 101,
+) -> "matplotlib.figure.Figure":
+    """Five-panel figure (accuracy / precision / recall / F1 / F2 vs threshold).
+
+    Matches Fig 5 of arXiv:2407.21453 — one line per class on each panel.
+    Skips classes in `result.non_target_names` by default.
+    """
+    import matplotlib.pyplot as plt
+
+    target = _display_classes(result, classes, target_only)
+    thr = np.linspace(0.0, 1.0, n_thresholds)
+    metrics = ("accuracy", "precision", "recall", "f1", "f2")
+    fig, axes = plt.subplots(1, 5, figsize=(18, 3.4), sharey=True)
+    for c, name in enumerate(result.label_names):
+        if name not in target:
+            continue
+        yt = (result.y_true[:, c] >= 0.5).astype(int)
+        if yt.sum() == 0:
+            continue
+        curve = threshold_curve(yt, result.y_score[:, c], thr)
+        for ax, m in zip(axes, metrics):
+            ax.plot(thr, curve[m], label=name, linewidth=1.0)
+    for ax, m in zip(axes, metrics):
+        ax.set_title(m)
+        ax.set_xlabel("t")
+        ax.set_ylim(0, 1.02)
+        ax.grid(True, linestyle="--", linewidth=0.4, alpha=0.6)
+    axes[0].set_ylabel("score")
+    axes[-1].legend(fontsize=7, loc="lower left")
+    fig.suptitle("Per-class metrics vs threshold")
+    fig.tight_layout()
+    return fig
+
+
 # Float vs quantized comparison
 
 
-@dataclass
-class QuantComparison:
+class QuantComparison(BaseModel):
     float_eval: EvalResult
     quant_eval: EvalResult
 
@@ -473,6 +746,7 @@ def compare_float_vs_quantized(
     threshold: float | np.ndarray = 0.5,
     threshold_mode: ThresholdMode = "fixed",
     threshold_tuning_ds: tf.data.Dataset | None = None,
+    non_target_names: Iterable[str] = (),
 ) -> QuantComparison:
     """Evaluate float Keras + INT8 TFLite on the same loader.
 
@@ -480,6 +754,8 @@ def compare_float_vs_quantized(
     each backend tunes its own thresholds on `threshold_tuning_ds`, so the
     drop reflects what you'd actually deploy (each model at its own optimum)
     rather than penalizing INT8 with a float-tuned cutoff.
+
+    `non_target_names` populates target-only macro fields on both results.
     """
     f_eval = evaluate(
         float_model,
@@ -488,6 +764,7 @@ def compare_float_vs_quantized(
         threshold=threshold,
         threshold_mode=threshold_mode,
         threshold_tuning_ds=threshold_tuning_ds,
+        non_target_names=non_target_names,
     )
     q_eval = evaluate(
         Path(tflite_path),
@@ -496,6 +773,7 @@ def compare_float_vs_quantized(
         threshold=threshold,
         threshold_mode=threshold_mode,
         threshold_tuning_ds=threshold_tuning_ds,
+        non_target_names=non_target_names,
     )
     return QuantComparison(float_eval=f_eval, quant_eval=q_eval)
 

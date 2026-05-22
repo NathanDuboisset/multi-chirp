@@ -7,7 +7,16 @@ from typing import TYPE_CHECKING, Any, Callable, Literal, NamedTuple
 if TYPE_CHECKING:
     from keras import Model
 
-from building.models import bake, cnn1d, leaf, mel_cnn, model_eval, sincnet
+from building.models import (
+    bake,
+    cnn1d,
+    leaf,
+    mel_cnn,
+    model_eval,
+    sincnet,
+    squeezenet,
+    transformer,
+)
 from building.models._common import (
     MEL_INPUT_SHAPE,
     NUM_MEL_BINS,
@@ -30,6 +39,9 @@ REGISTRY: dict[str, _Entry] = {
     "leaf": _Entry(leaf.build, "time"),
     "mel_cnn": _Entry(mel_cnn.build, "mel"),
     "mel_cnn_2": _Entry(mel_cnn.build_2, "mel"),
+    "transformer": _Entry(transformer.build, "time"),
+    "squeezenet_mel": _Entry(squeezenet.build_mel, "mel"),
+    "squeezenet_time": _Entry(squeezenet.build_time, "time"),
 }
 
 

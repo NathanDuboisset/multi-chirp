@@ -21,3 +21,4 @@ models/
 !building/models/
 .cache/
 notebooks_thesis/
+recordings/

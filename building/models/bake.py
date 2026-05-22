@@ -19,12 +19,12 @@ import contextlib
 import io
 import re
 import tempfile
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterable, List
 
 import numpy as np
 import tensorflow as tf
+from pydantic import BaseModel, ConfigDict
 
 if TYPE_CHECKING:
     import keras
@@ -67,11 +67,14 @@ def representative_dataset_from_batches(
     return gen
 
 
-@dataclass
-class TFLiteStats:
+class TFLiteStats(BaseModel):
+    """Footprint numbers extracted from a baked .tflite flatbuffer."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     path: Path
     model_size_kb: float
-    arena_size_kb: float | None
+    arena_size_kb: float | None = None
     flops_mflops: float
     input_dtype: str
     output_dtype: str

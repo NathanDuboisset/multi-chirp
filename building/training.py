@@ -68,6 +68,28 @@ class DatasetCatalog(BaseModel):
     entries: list[ClassEntry]  # parallel to class_names
 
 
+class PerClassMetricsLite(BaseModel):
+    """Per-class metrics at a fixed threshold, persisted in run results."""
+
+    support: int
+    accuracy: float
+    precision: float
+    recall: float
+    f1: float
+    f2: float
+    auc: float | None = None
+
+
+class MacroBlock(BaseModel):
+    """Mean-over-classes summary at the chosen threshold."""
+
+    precision: float
+    recall: float
+    f1: float
+    f2: float
+    auc: float | None = None
+
+
 class RunMetrics(BaseModel):
     recall_mean: float
     recall_std: float
@@ -77,6 +99,11 @@ class RunMetrics(BaseModel):
     f1_std: float
     top1_accuracy: float
     loss: float
+    # New fields — optional for backwards-compat with old jsonl rows.
+    per_class: dict[str, PerClassMetricsLite] | None = None
+    macro_targets: MacroBlock | None = None
+    macro_all: MacroBlock | None = None
+    threshold: float | None = None
 
 
 @dataclass
@@ -551,20 +578,95 @@ def collect_predictions(
 
 
 def compute_metrics(
-    y_true: np.ndarray, y_pred: np.ndarray, threshold: float, loss: float
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    threshold: float,
+    loss: float,
+    class_names: list[str] | None = None,
+    non_target_names: Iterable[str] = (),
 ) -> RunMetrics:
+    """Aggregate run-level metrics from raw predictions.
+
+    When `class_names` is given, fills per-class detail and target-only macros
+    in the returned `RunMetrics`. Legacy fields (recall_mean / std / ...) keep
+    their original semantics (averaged over *every* class) so old jsonl
+    consumers continue to work.
+    """
+    from sklearn.metrics import roc_auc_score
+
+    n_classes = y_true.shape[1]
+    if class_names is not None and len(class_names) != n_classes:
+        raise ValueError(
+            f"class_names has {len(class_names)} entries but y_true has "
+            f"{n_classes} columns."
+        )
+
     recalls, precisions, f1s = [], [], []
-    for c in range(y_true.shape[1]):
+    per_class: dict[str, PerClassMetricsLite] = {}
+    for c in range(n_classes):
         true_c = y_true[:, c] >= 0.5
         pred_c = y_pred[:, c] >= threshold
-        rec = float(np.mean(pred_c[true_c])) if true_c.any() else None
-        prec = float(np.mean(true_c[pred_c])) if pred_c.any() else None
-        if rec is not None:
-            recalls.append(rec)
-        if prec is not None:
-            precisions.append(prec)
-        if rec is not None and prec is not None and (rec + prec) > 0:
-            f1s.append(2 * rec * prec / (rec + prec))
+        tp = int((pred_c & true_c).sum())
+        fp = int((pred_c & ~true_c).sum())
+        fn = int((~pred_c & true_c).sum())
+        tn = int((~pred_c & ~true_c).sum())
+        rec_v = tp / (tp + fn) if (tp + fn) else None
+        prec_v = tp / (tp + fp) if (tp + fp) else None
+        if rec_v is not None:
+            recalls.append(rec_v)
+        if prec_v is not None:
+            precisions.append(prec_v)
+        if rec_v is not None and prec_v is not None and (rec_v + prec_v) > 0:
+            f1s.append(2 * rec_v * prec_v / (rec_v + prec_v))
+
+        if class_names is not None:
+            p = prec_v if prec_v is not None else 0.0
+            r = rec_v if rec_v is not None else 0.0
+            f1 = 2 * p * r / (p + r) if (p + r) else 0.0
+            d2 = 4 * p + r
+            f2 = 5 * p * r / d2 if d2 else 0.0
+            n = tp + fp + fn + tn
+            acc = (tp + tn) / n if n else 0.0
+            auc: float | None = None
+            ys = y_pred[:, c]
+            if true_c.any() and not true_c.all():
+                auc = float(roc_auc_score(true_c.astype(int), ys))
+            per_class[class_names[c]] = PerClassMetricsLite(
+                support=int(true_c.sum()),
+                accuracy=float(acc),
+                precision=float(p),
+                recall=float(r),
+                f1=float(f1),
+                f2=float(f2),
+                auc=auc,
+            )
+
+    macro_targets: MacroBlock | None = None
+    macro_all: MacroBlock | None = None
+    if class_names is not None:
+        nt = set(non_target_names)
+
+        def _aggregate(names: list[str]) -> MacroBlock | None:
+            if not names:
+                return None
+            ms = [per_class[n] for n in names]
+            aucs = [m.auc for m in ms]
+            return MacroBlock(
+                precision=float(np.mean([m.precision for m in ms])),
+                recall=float(np.mean([m.recall for m in ms])),
+                f1=float(np.mean([m.f1 for m in ms])),
+                f2=float(np.mean([m.f2 for m in ms])),
+                auc=(
+                    float(np.mean(aucs))
+                    if aucs and all(a is not None for a in aucs)
+                    else None
+                ),
+            )
+
+        macro_all = _aggregate(class_names)
+        target_names = [n for n in class_names if n not in nt]
+        macro_targets = _aggregate(target_names)
+
     return RunMetrics(
         recall_mean=float(np.mean(recalls)) if recalls else 0.0,
         recall_std=float(np.std(recalls)) if recalls else 0.0,
@@ -574,4 +676,8 @@ def compute_metrics(
         f1_std=float(np.std(f1s)) if f1s else 0.0,
         top1_accuracy=float(np.mean(np.argmax(y_true, 1) == np.argmax(y_pred, 1))),
         loss=loss,
+        per_class=per_class or None,
+        macro_targets=macro_targets,
+        macro_all=macro_all,
+        threshold=float(threshold) if class_names is not None else None,
     )
