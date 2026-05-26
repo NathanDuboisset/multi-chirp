@@ -140,6 +140,8 @@ def bake_model(
     *,
     n_representative: int = 100,
     verbose: bool = True,
+    denylisted_ops: list[str] | None = None,
+    int16_activations: bool = False,
 ) -> TFLiteStats:
     """Quantize `model` to INT8 .tflite using `rep_dataset` for calibration.
 
@@ -150,6 +152,19 @@ def bake_model(
 
     The TFLite I/O dtypes are int8 — downstream evaluation has to quantize
     inputs and dequantize outputs (see `model_eval.evaluate`).
+
+    `denylisted_ops` keeps the named ops in float (with auto-inserted
+    QUANTIZE/DEQUANTIZE boundaries), while everything else is INT8. Use this
+    for ops whose INT8 kernel exists but has catastrophic numerics — notably
+    `tf.pow` with a learned per-channel exponent in PCEN. For the LEAF
+    frontend, pass `denylisted_ops=['POW', 'DIV']`. I/O stays int8.
+
+    `int16_activations=True` switches to INT16 activations + INT8 weights
+    (`EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8`). Weights
+    stay 8-bit so flash cost is unchanged; activations get 65,536 levels
+    instead of 256, so models whose pre-sigmoid logits saturate under INT8
+    (LEAF/PCEN, anything with a wide-dynamic-range frontend) recover. I/O is
+    INT16 in this mode.
     """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -176,13 +191,44 @@ def bake_model(
 
         converter = tf.lite.TFLiteConverter.from_saved_model(tmp_dir)
         converter.optimizations = [tf.lite.Optimize.DEFAULT]
-        converter.representative_dataset = representative_dataset_from_batches(
-            rep_batches
-        )
-        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
-        converter.inference_input_type = tf.int8
-        converter.inference_output_type = tf.int8
-        out_path.write_bytes(converter.convert())
+        rep_gen = representative_dataset_from_batches(rep_batches)
+        converter.representative_dataset = rep_gen
+
+        if int16_activations:
+            # INT16×8: ops without an INT16x8 kernel (SQUARE/SQRT/POW/DIV) fall
+            # back to float via TFLITE_BUILTINS. The QuantizationDebugger does
+            # not honor the INT16x8 op set, so we use the bare converter and
+            # accept whatever I/O type it produces.
+            converter.target_spec.supported_ops = [
+                tf.lite.OpsSet.EXPERIMENTAL_TFLITE_BUILTINS_ACTIVATIONS_INT16_WEIGHTS_INT8,
+                tf.lite.OpsSet.TFLITE_BUILTINS,
+            ]
+            out_path.write_bytes(converter.convert())
+        elif denylisted_ops:
+            # Float fallback must be allowed for the denylisted ops to stay in float.
+            converter.target_spec.supported_ops = [
+                tf.lite.OpsSet.TFLITE_BUILTINS_INT8,
+                tf.lite.OpsSet.TFLITE_BUILTINS,
+            ]
+            converter.inference_input_type = tf.int8
+            converter.inference_output_type = tf.int8
+            debug_options = tf.lite.experimental.QuantizationDebugOptions(
+                denylisted_ops=list(denylisted_ops),
+                fully_quantize=True,
+            )
+            debugger = tf.lite.experimental.QuantizationDebugger(
+                converter=converter,
+                debug_dataset=rep_gen,
+                debug_options=debug_options,
+            )
+            out_path.write_bytes(debugger.get_nondebug_quantized_model())
+        else:
+            converter.target_spec.supported_ops = [
+                tf.lite.OpsSet.TFLITE_BUILTINS_INT8
+            ]
+            converter.inference_input_type = tf.int8
+            converter.inference_output_type = tf.int8
+            out_path.write_bytes(converter.convert())
 
     stats = analyze_tflite(out_path)
     if verbose:

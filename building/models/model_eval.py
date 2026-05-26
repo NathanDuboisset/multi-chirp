@@ -707,7 +707,7 @@ def plot_metric_sweep_panel(
     target = _display_classes(result, classes, target_only)
     thr = np.linspace(0.0, 1.0, n_thresholds)
     metrics = ("accuracy", "precision", "recall", "f1", "f2")
-    fig, axes = plt.subplots(1, 5, figsize=(18, 3.4), sharey=True)
+    fig, axes = plt.subplots(1, 5, figsize=(18,5), sharey=True)
     for c, name in enumerate(result.label_names):
         if name not in target:
             continue
