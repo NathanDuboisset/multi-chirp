@@ -63,14 +63,33 @@ def _predict_tflite(
     interp.allocate_tensors()
     inp = interp.get_input_details()[0]
     out = interp.get_output_details()[0]
+    in_dtype = inp["dtype"]
+    out_dtype = out["dtype"]
     in_scale, in_zp = inp["quantization"]
     out_scale, out_zp = out["quantization"]
-    if in_scale == 0 or out_scale == 0:
-        raise ValueError(
-            f"{tflite_path} has zero quantization scale — not an INT8 model?"
-        )
-    qmin, qmax = (-128, 127) if inp["dtype"] == np.int8 else (0, 255)
     in_rank = len(inp["shape"])
+
+    # Build per-sample quantize / dequantize closures based on the actual
+    # IO dtype the converter produced. INT8/UINT8 = full-integer PTQ;
+    # INT16 = INT16x8 mode; FLOAT32 = weight-only / dynamic-range PTQ.
+    if in_dtype == np.float32:
+        quantize_input = lambda x: x.astype(np.float32)[None, ...]
+    elif in_dtype in (np.int8, np.uint8):
+        qmin, qmax = (-128, 127) if in_dtype == np.int8 else (0, 255)
+        quantize_input = lambda x: np.clip(
+            np.round(x / in_scale) + in_zp, qmin, qmax
+        ).astype(in_dtype)[None, ...]
+    elif in_dtype == np.int16:
+        quantize_input = lambda x: np.clip(
+            np.round(x / in_scale) + in_zp, -32768, 32767
+        ).astype(np.int16)[None, ...]
+    else:
+        raise ValueError(f"{tflite_path} has unsupported input dtype {in_dtype}")
+
+    if out_dtype == np.float32:
+        dequantize_output = lambda raw: raw.astype(np.float32)
+    else:
+        dequantize_output = lambda raw: (raw.astype(np.float32) - out_zp) * out_scale
 
     y_true: list[np.ndarray] = []
     y_score: list[np.ndarray] = []
@@ -84,16 +103,13 @@ def _predict_tflite(
                     f"Sample rank {x.ndim} does not match TFLite input rank "
                     f"{in_rank - 1} (input shape {inp['shape']})."
                 )
-            xq = np.clip(np.round(x / in_scale) + in_zp, qmin, qmax).astype(
-                inp["dtype"]
-            )[None, ...]
+            xq = quantize_input(x)
             interp.set_tensor(inp["index"], xq)
             t0 = time.perf_counter()
             interp.invoke()
             times.append(time.perf_counter() - t0)
-            raw = interp.get_tensor(out["index"]).astype(np.float32)
-            probs = (raw - out_zp) * out_scale
-            y_score.append(probs.reshape(-1))
+            raw = interp.get_tensor(out["index"])
+            y_score.append(dequantize_output(raw).reshape(-1))
             y_true.append(yb[i])
     avg_ms = float(np.mean(times) * 1000.0) if times else 0.0
     return np.asarray(y_true), np.asarray(y_score), avg_ms

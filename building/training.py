@@ -297,12 +297,9 @@ def build_dataset_from_catalog(
     other_label = len(chosen_idxs)
     do_shuffle = split == "train"
 
-    # AutoGraph can't introspect lambdas/closures defined here when this module
-    # is reloaded inside a notebook, so wrap every map fn with do_not_convert.
+    # AutoGraph breaks on reloaded notebook closures; wrap every map fn.
     nag = tf.autograph.experimental.do_not_convert
 
-    # Build per-class labelled streams. counts_by_label is the natural epoch
-    # budget per class — what we'd like to see in one full pass.
     counts_by_label: dict[int, int] = {}
     raw_per_class: list[tf.data.Dataset] = []
     for local_label, (cs, count) in enumerate(
@@ -324,11 +321,8 @@ def build_dataset_from_catalog(
     total_samples = sum(counts_by_label.values())
 
     if do_shuffle:
-        # Weighted interleave: each per-class stream is shuffled within its
-        # own buffer (cheap, since per-class buffer fits well under
-        # SHUFFLE_BUFFER_CAP) and repeated; sample_from_datasets mixes them
-        # in natural-distribution proportions every batch. Epoch length is
-        # pinned to total_samples so cardinality is known.
+        # Per-class shuffle + numpy-shuffled label schedule via choose_from_datasets:
+        # each sample is visited exactly once per epoch at natural class proportions.
         per_class_streams: list[tf.data.Dataset] = []
         for lbl_idx, ds_lbl in enumerate(raw_per_class):
             count = counts_by_label[lbl_idx]
@@ -337,22 +331,30 @@ def build_dataset_from_catalog(
             per_class_streams.append(
                 ds_lbl.shuffle(
                     shuffle_buf, seed=seed, reshuffle_each_iteration=True
-                ).repeat()
+                )
             )
-        weights = [counts_by_label[i] / total_samples for i in range(n_classes)]
-        combined = tf.data.Dataset.sample_from_datasets(
-            per_class_streams,
-            weights=weights,
-            seed=int(rng.integers(0, 2**31 - 1)),
-            stop_on_empty_dataset=False,
-        ).take(total_samples)
+        schedule = np.concatenate(
+            [
+                np.full(counts_by_label[i], i, dtype=np.int64)
+                for i in range(n_classes)
+            ]
+        )
+        np.random.default_rng(int(rng.integers(0, 2**31 - 1))).shuffle(schedule)
+        schedule_ds = tf.data.Dataset.from_tensor_slices(schedule)
+        combined = tf.data.Dataset.choose_from_datasets(
+            per_class_streams, schedule_ds
+        )
+        # choose_from_datasets reports UNKNOWN cardinality; reassert to silence
+        # Keras' spurious "ran out of data" warning on the final partial batch.
+        combined = combined.apply(
+            tf.data.experimental.assert_cardinality(int(total_samples))
+        )
     else:
         combined = raw_per_class[0]
         for p in raw_per_class[1:]:
             combined = combined.concatenate(p)
 
-    # Mean-normalised inverse-frequency weights: w_c = N / (K * n_c), then
-    # rescaled so the mean weight = 1 (keeps the loss scale comparable).
+    # Inverse-frequency weights w_c = N / (K * n_c), rescaled to mean=1.
     raw_weights = {
         lbl: total_samples / (n_classes * count)
         for lbl, count in counts_by_label.items()
@@ -360,8 +362,8 @@ def build_dataset_from_catalog(
     mean_w = sum(raw_weights.values()) / len(raw_weights)
     class_weights = {lbl: w / mean_w for lbl, w in raw_weights.items()}
 
-    # Per-sample waveform augmentation (train split only). Runs *before* the
-    # mel STFT so polarity flip / shift / noise affect the spectrogram.
+    # Waveform augmentation runs before _featurize so polarity/shift/noise
+    # also affect the downstream mel STFT.
     if do_shuffle and augment:
         from building.data.augmentation import augment_tf
 
@@ -396,10 +398,8 @@ def build_dataset_from_catalog(
         def _featurize(xb: tf.Tensor) -> tf.Tensor:
             return tf.expand_dims(xb, -1)
 
-    # Emit sample_weight for train + val (Keras consumes the 3-tuple
-    # natively and EarlyStopping then monitors a class-balanced val_loss).
-    # Test stays as a 2-tuple so the downstream metric helpers iterate it
-    # as (xb, yb) and report the honest natural-distribution test loss.
+    # train + val emit sample_weight (Keras → class-balanced val_loss for
+    # EarlyStopping); test stays a 2-tuple for honest natural-distribution loss.
     weighted = split in ("train", "val")
     if weighted:
         @nag

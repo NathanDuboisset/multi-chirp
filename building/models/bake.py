@@ -142,6 +142,7 @@ def bake_model(
     verbose: bool = True,
     denylisted_ops: list[str] | None = None,
     int16_activations: bool = False,
+    weight_only: bool = False,
 ) -> TFLiteStats:
     """Quantize `model` to INT8 .tflite using `rep_dataset` for calibration.
 
@@ -165,7 +166,20 @@ def bake_model(
     instead of 256, so models whose pre-sigmoid logits saturate under INT8
     (LEAF/PCEN, anything with a wide-dynamic-range frontend) recover. I/O is
     INT16 in this mode.
+
+    `weight_only=True` does *dynamic-range* PTQ: INT8 weights, float
+    activations. Skips activation calibration entirely (rep dataset is
+    unused). For LEAF/PCEN the per-tensor activation scales collapse the
+    model regardless of denylisted_ops / int16_activations — keeping
+    activations in float recovers float accuracy with ~17% larger flash
+    than full INT8 (15.7 KB vs 13.2 KB for the LEAF backbone). I/O is
+    float32. Mutually exclusive with the other modes.
     """
+    if sum(bool(x) for x in (denylisted_ops, int16_activations, weight_only)) > 1:
+        raise ValueError(
+            "denylisted_ops, int16_activations, weight_only are mutually exclusive."
+        )
+
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -192,9 +206,14 @@ def bake_model(
         converter = tf.lite.TFLiteConverter.from_saved_model(tmp_dir)
         converter.optimizations = [tf.lite.Optimize.DEFAULT]
         rep_gen = representative_dataset_from_batches(rep_batches)
-        converter.representative_dataset = rep_gen
+        if not weight_only:
+            converter.representative_dataset = rep_gen
 
-        if int16_activations:
+        if weight_only:
+            # Dynamic-range PTQ: Optimize.DEFAULT with no representative
+            # dataset quantizes weights to INT8 and leaves activations float.
+            out_path.write_bytes(converter.convert())
+        elif int16_activations:
             # INT16×8: ops without an INT16x8 kernel (SQUARE/SQRT/POW/DIV) fall
             # back to float via TFLITE_BUILTINS. The QuantizationDebugger does
             # not honor the INT16x8 op set, so we use the bare converter and
@@ -232,7 +251,13 @@ def bake_model(
 
     stats = analyze_tflite(out_path)
     if verbose:
-        print(f"Baked INT8 TFLite -> {out_path}")
+        mode = (
+            "weight-only" if weight_only
+            else "INT16x8" if int16_activations
+            else "INT8 (denylist)" if denylisted_ops
+            else "INT8"
+        )
+        print(f"Baked {mode} TFLite -> {out_path}")
         print(f"  flash (weights)  : {stats.model_size_kb:>8.1f} KB")
         if stats.arena_size_kb is not None:
             print(f"  arena (activ.)   : {stats.arena_size_kb:>8.1f} KB")

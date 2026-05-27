@@ -280,6 +280,26 @@ css = [
 ]
 
 [[package]]
+name = "bokeh"
+version = "3.9.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "contourpy" },
+    { name = "jinja2" },
+    { name = "narwhals" },
+    { name = "numpy" },
+    { name = "packaging" },
+    { name = "pillow" },
+    { name = "pyyaml" },
+    { name = "tornado", marker = "sys_platform != 'emscripten'" },
+    { name = "xyzservices" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/bf/0d/fabb70707646217e4b0e3943e05730eab8c1f7b7e7485145f8594b52e606/bokeh-3.9.0.tar.gz", hash = "sha256:775219714a8496973ddbae16b1861606ba19fe670a421e4d43267b41148e07a3", size = 5740345, upload-time = "2026-03-11T17:58:34.062Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/47/0b/bdf449df87be3f07b23091ceafee8c3ef569cf6d2fb7edec6e3b12b3faa4/bokeh-3.9.0-py3-none-any.whl", hash = "sha256:b252bfb16a505f0e0c57d532d0df308ae1667235bafc622aa9441fe9e7c5ce4a", size = 6396068, upload-time = "2026-03-11T17:58:31.645Z" },
+]
+
+[[package]]
 name = "branca"
 version = "0.8.2"
 source = { registry = "https://pypi.org/simple" }
@@ -1239,6 +1259,20 @@ wheels = [
 ]
 
 [[package]]
+name = "livelossplot"
+version = "0.6.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "bokeh" },
+    { name = "ipython" },
+    { name = "matplotlib" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/8d/aa/5ba931ee2874385b4f70ada647df2a67fb7df7ec17ad29e6d0fcef5f16ee/livelossplot-0.6.1.tar.gz", hash = "sha256:0a05d17b9120a98012c589fc62388e77c87227607ce8ef5acbda375ab5029661", size = 16657, upload-time = "2026-05-05T08:42:24.441Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4f/22/3ae6825052f0a95d2f39dd1991a41802292bd1ee047d1eb63bcc54374830/livelossplot-0.6.1-py3-none-any.whl", hash = "sha256:4ef87dd1e32af153e141b7ea7a0f43205c917e6e88d508d299441c73c04034a2", size = 20470, upload-time = "2026-05-05T08:42:25.563Z" },
+]
+
+[[package]]
 name = "llvmlite"
 version = "0.46.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1427,6 +1461,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/0c/c0/ee95b28f029c73f8d49d8f52edaed02a1d4a9acb8b69355737fdb1faa191/namex-0.1.0.tar.gz", hash = "sha256:117f03ccd302cc48e3f5c58a296838f6b89c83455ab8683a1e85f2a430aa4306", size = 6649, upload-time = "2025-05-26T23:17:38.918Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b2/bc/465daf1de06409cdd4532082806770ee0d8d7df434da79c76564d0f69741/namex-0.1.0-py3-none-any.whl", hash = "sha256:e2012a474502f1e2251267062aae3114611f07df4224b6e06334c57b0f2ce87c", size = 5905, upload-time = "2025-05-26T23:17:37.695Z" },
+]
+
+[[package]]
+name = "narwhals"
+version = "2.21.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/cf/a0/6198c56d42ef2f3c6ed0c42ba30dbcefdc86a91262d7d449010770ae085b/narwhals-2.21.2.tar.gz", hash = "sha256:5c5b2d0b47aef7c73ea412cfcbcd467f2f2d5be73e3c2ab19d78f4a97718790a", size = 632176, upload-time = "2026-05-16T08:49:08.314Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1d/77/928ea2e70641ca177a11140062cc5840d421795f2e82749d408d0cce900a/narwhals-2.21.2-py3-none-any.whl", hash = "sha256:7bb57c3700486039215455b9bf2d64261915cc0fd845cc30272d631df696b251", size = 451201, upload-time = "2026-05-16T08:49:05.536Z" },
 ]
 
 [[package]]
@@ -2583,6 +2626,7 @@ dependencies = [
     { name = "jupyter" },
     { name = "keras" },
     { name = "librosa" },
+    { name = "livelossplot" },
     { name = "matplotlib" },
     { name = "numpy" },
     { name = "pandas" },
@@ -2612,6 +2656,7 @@ requires-dist = [
     { name = "jupyter" },
     { name = "keras", specifier = ">=3.13.2" },
     { name = "librosa" },
+    { name = "livelossplot", specifier = ">=0.6.1" },
     { name = "matplotlib", specifier = ">=3.10.8" },
     { name = "numpy" },
     { name = "pandas", specifier = ">=2.0" },

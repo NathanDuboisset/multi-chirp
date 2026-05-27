@@ -1,10 +1,23 @@
-"""LEAF: Gabor filterbank + Gaussian pooling + PCEN compression on raw waveform.
+"""LEAF: Gabor filterbank + Gaussian pooling + PCEN on raw waveform.
 
-PCEN's learnable per-channel `tf.pow` exponents need to be excluded from INT8
-quantization to preserve numerics (a single per-tensor LUT cannot represent 32
-different exponents). At bake time pass `denylisted_ops=['POW', 'DIV']` (or use
-the leaf-specific bake helper) so those ops stay in float, with auto-inserted
-QUANTIZE/DEQUANTIZE boundaries around them.
+PTQ recipe
+----------
+Full-integer PTQ collapses this model regardless of `denylisted_ops`,
+`int16_activations`, or representative-set diversity (F2 -0.68, AUC -0.31
+on the 4-class geographic task). The blame falls on per-tensor activation
+scales fundamentally failing to capture per-channel distributions:
+
+  * PCEN learns per-channel `alpha`, `delta`, `root` so the output has wildly
+    different ranges per channel.
+  * The standalone BatchNormalization right after PCEN cannot fold into a
+    preceding op (PCEN is not a Conv), so its per-channel mul/add survive
+    as standalone INT8 ops with rmse/scale ≈ 6-8.
+  * Even with float fallback for POW/DIV, the downstream global average
+    pool + dense layers see catastrophic precision loss (rmse/scale > 40).
+
+Use `bake_model(..., weight_only=True)` — dynamic-range PTQ keeps INT8
+weights but leaves activations in float32. Flash 15.7 KB (vs 13.2 KB for
+full INT8); inference recovers float accuracy (F2 = 0.944 vs 0.956 float).
 """
 
 from __future__ import annotations
@@ -13,6 +26,7 @@ import math
 
 import tensorflow as tf
 from keras import Model, layers
+from keras.saving import register_keras_serializable
 
 from building.models._common import TARGET_AUDIO_LEN, compile_model
 
@@ -24,6 +38,7 @@ PCEN_SMOOTH_SIZE = 15
 EPS = 1e-3
 
 
+@register_keras_serializable(package="leaf")
 class GaborConv1D(layers.Layer):
     def __init__(self, num_filters, kernel_size, stride=1, **kwargs):
         super().__init__(**kwargs)
@@ -35,6 +50,14 @@ class GaborConv1D(layers.Layer):
             shape=(1, 1, num_filters), initializer="random_uniform"
         )
         self.bandwidths = self.add_weight(shape=(1, 1, num_filters), initializer="ones")
+
+    def get_config(self):
+        return {
+            **super().get_config(),
+            "num_filters": self.num_filters,
+            "kernel_size": self.kernel_size,
+            "stride": self.stride,
+        }
 
     def get_filters(self):
         limit = (self.kernel_size - 1) / 2.0
@@ -48,10 +71,11 @@ class GaborConv1D(layers.Layer):
     def call(self, inputs):
         conv = tf.nn.conv1d(inputs, self.get_filters(), stride=self.stride, padding="SAME")
         real, imag = tf.split(conv, 2, axis=-1)
-        # Magnitude, not energy: halves the dynamic range vs square+sum (INT8-friendly).
+        # Magnitude (not energy) keeps dynamic range INT8-friendly.
         return tf.sqrt(tf.square(real) + tf.square(imag) + EPS)
 
 
+@register_keras_serializable(package="leaf")
 class GaussianPool1D(layers.Layer):
     def __init__(self, num_filters, pool_size, stride, **kwargs):
         super().__init__(**kwargs)
@@ -62,6 +86,14 @@ class GaussianPool1D(layers.Layer):
             shape=(1, num_filters, 1), initializer=tf.constant_initializer(0.4)
         )
 
+    def get_config(self):
+        return {
+            **super().get_config(),
+            "num_filters": self.num_filters,
+            "pool_size": self.pool_size,
+            "stride": self.stride,
+        }
+
     def get_filters(self):
         limit = (self.pool_size - 1) / 2.0
         t = tf.cast(tf.linspace(-limit, limit, self.pool_size), tf.float32)
@@ -70,10 +102,8 @@ class GaussianPool1D(layers.Layer):
         return gauss / tf.reduce_sum(gauss, axis=0, keepdims=True)
 
     def call(self, inputs):
-        # GPU's depthwise_conv2d requires equal row/col strides. We reproduce
-        # `stride=S SAME` bit-exactly by computing the same explicit padding TF
-        # would have used, running the conv at stride=1 VALID (equal strides,
-        # GPU-safe), then decimating by S.
+        # GPU depthwise_conv2d requires equal row/col strides; emulate
+        # `stride=S SAME` via explicit pad + stride=1 VALID + decimate.
         k, s = self.pool_size, self.stride
         t = tf.shape(inputs)[1]
         out_t = -(-t // s)  # ceil(t / s)
@@ -92,15 +122,12 @@ class GaussianPool1D(layers.Layer):
         return smoothed[:, ::s, :]
 
 
+@register_keras_serializable(package="leaf")
 class PCEN(layers.Layer):
-    """Per-Channel Energy Normalization.
+    """Per-Channel Energy Normalization: y = ((x+eps)/(eps+M)^alpha + delta)^r - delta^r.
 
-    y = ((x + eps) / (eps + M)^alpha + delta)^r - delta^r
-
-    M is a per-channel temporal-smoothed estimate of the energy, computed with a
-    depthwise Gaussian conv (parallel, INT8-friendly — no recurrent IIR scan).
-    Brings the per-channel activation distribution close to Gaussian, which is
-    exactly what INT8 calibration assumes — replaces log compression.
+    M = depthwise Gaussian smoothing of x (parallel, INT8-friendly — no IIR scan).
+    Replaces log compression; activation distribution is closer to Gaussian.
     """
 
     def __init__(self, num_filters, smooth_size=PCEN_SMOOTH_SIZE, **kwargs):
@@ -128,6 +155,13 @@ class PCEN(layers.Layer):
             initializer=tf.constant_initializer(0.2),
             name="smooth_bw",
         )
+
+    def get_config(self):
+        return {
+            **super().get_config(),
+            "num_filters": self.num_filters,
+            "smooth_size": self.smooth_size,
+        }
 
     def get_smoothing_filters(self):
         limit = (self.smooth_size - 1) / 2.0
@@ -165,26 +199,26 @@ def build(n_classes: int, input_len: int = TARGET_AUDIO_LEN) -> Model:
         name="gauss_pool",
     )(x)
     x = PCEN(num_filters=NUM_FILTERS, name="pcen")(x)
-    x = layers.BatchNormalization(name="pcen_bn")(x)
+    # BN momentum=0.9: moving stats track val-time distribution within a few
+    # epochs; default 0.99 takes ~100 and amplifies train/val mismatch.
+    x = layers.BatchNormalization(momentum=0.9, name="pcen_bn")(x)
 
-    # BatchNorm after every Conv/Dense keeps activation distributions ~N(0,1)
-    # per-channel, so per-tensor INT8 calibration is uniform across channels
-    # and pre-sigmoid logits don't blow up. Without these, INT8 binarizes the
-    # sigmoid output and the model collapses.
+    # Post-Conv BN is required for INT8 — without it, per-tensor calibration
+    # binarizes the sigmoid output.
     x = layers.Conv1D(filters=16, kernel_size=3, padding="same")(x)
-    x = layers.BatchNormalization()(x)
+    x = layers.BatchNormalization(momentum=0.9)(x)
     x = layers.ReLU()(x)
     x = layers.MaxPooling1D(pool_size=2)(x)
     x = layers.Dropout(0.25)(x)
 
     x = layers.Conv1D(filters=32, kernel_size=3, padding="same")(x)
-    x = layers.BatchNormalization()(x)
+    x = layers.BatchNormalization(momentum=0.9)(x)
     x = layers.ReLU()(x)
     x = layers.MaxPooling1D(pool_size=2)(x)
 
     x = layers.GlobalAveragePooling1D()(x)
     x = layers.Dense(64)(x)
-    x = layers.BatchNormalization()(x)
+    x = layers.BatchNormalization(momentum=0.9)(x)
     x = layers.ReLU()(x)
     outputs = layers.Dense(n_classes, activation="sigmoid", name="predictions")(x)
     return compile_model(Model(inputs, outputs, name="leaf"))
