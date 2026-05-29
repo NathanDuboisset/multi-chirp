@@ -1,5 +1,3 @@
-"""Area-scoped XC exploration: heatmaps, taxonomy, BirdNET pass."""
-
 from __future__ import annotations
 
 import asyncio
@@ -41,18 +39,13 @@ RAW_DATASET_DIR = ROOT / "raw_dataset"
 TAXONOMY_FILE = RAW_DATASET_DIR / "taxonomy.csv"
 ANALYSIS_DIR = RAW_DATASET_DIR / "analysis"
 
-BBox = tuple[float, float, float, float]  # (lat_min, lon_min, lat_max, lon_max)
+BBox = tuple[float, float, float, float]
 
 
 def bbox_from_radius(lat: float, lon: float, radius_km: float) -> BBox:
-    """Center + radius to (lat_min, lon_min, lat_max, lon_max)."""
     dlat = radius_km / 111.0
     dlon = radius_km / (111.0 * max(math.cos(math.radians(lat)), 1e-6))
     return (lat - dlat, lon - dlon, lat + dlat, lon + dlon)
-
-
-def _api_key() -> str:
-    return os.getenv("XC_API_KEY", "demo")
 
 
 async def _collect(builder) -> list[Recording]:
@@ -63,8 +56,7 @@ async def fetch_species_global(
     species_names: list[str],
     min_quality: Quality = MINIMUM_QUALITY,
 ) -> dict[str, list[Recording]]:
-    """One XC query per species, no area filter. Used for global heatmaps."""
-    async with AsyncXenoCantoClient(api_key=_api_key()) as xc:
+    async with AsyncXenoCantoClient(api_key=os.getenv("XC_API_KEY", "demo")) as xc:
         builders = [
             xc.query().sp(name).grp(Group.BIRDS).q_min(min_quality)
             for name in species_names
@@ -77,14 +69,8 @@ async def fetch_area_recordings(
     bbox: BBox,
     min_quality: Quality = MINIMUM_QUALITY,
 ) -> list[Recording]:
-    """All bird recordings inside the bbox."""
-    async with AsyncXenoCantoClient(api_key=_api_key()) as xc:
-        builder = (
-            xc.query()
-            .grp(Group.BIRDS)
-            .box(*bbox)
-            .q_min(min_quality)
-        )
+    async with AsyncXenoCantoClient(api_key=os.getenv("XC_API_KEY", "demo")) as xc:
+        builder = xc.query().grp(Group.BIRDS).box(*bbox).q_min(min_quality)
         return await _collect(builder)
 
 
@@ -112,12 +98,10 @@ def recordings_to_df(recordings: Iterable[Recording]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _layer_color(i: int) -> str:
-    palette = [
-        "red", "blue", "green", "purple", "orange",
-        "darkred", "cadetblue", "darkgreen", "darkpurple", "pink",
-    ]
-    return palette[i % len(palette)]
+_HEATMAP_PALETTE = (
+    "red", "blue", "green", "purple", "orange",
+    "darkred", "cadetblue", "darkgreen", "darkpurple", "pink",
+)
 
 
 def build_heatmap(
@@ -126,7 +110,6 @@ def build_heatmap(
     bbox: BBox | None = None,
     zoom_start: int = 6,
 ) -> folium.Map:
-    """Per-species toggleable heat layers, with optional bbox rectangle."""
     m = folium.Map(location=list(center), zoom_start=zoom_start, tiles="cartodbpositron")
 
     for i, (species, df) in enumerate(per_species.items()):
@@ -137,7 +120,7 @@ def build_heatmap(
         folium.CircleMarker(
             location=list(center),
             radius=4,
-            color=_layer_color(i),
+            color=_HEATMAP_PALETTE[i % len(_HEATMAP_PALETTE)],
             fill=True,
         ).add_to(fg)
         fg.add_to(m)
@@ -171,9 +154,6 @@ def _load_taxonomy() -> pd.DataFrame:
 def taxonomy_breakdown(
     area_df: pd.DataFrame, min_recordings: int = 1
 ) -> dict[str, pd.DataFrame]:
-    """Per-level counts + totals. Species with fewer than ``min_recordings``
-    recordings in the area are dropped before counting, so genus/family/order
-    totals reflect only the species that survive the filter."""
     tax = _load_taxonomy()
     joined = area_df.merge(tax, on="scientific_name", how="left")
     if min_recordings > 1:
@@ -290,26 +270,21 @@ def area_audio_cache_dir(
     radius_km: float,
     base: Path = AUDIO_CACHE_DIR,
 ) -> Path:
-    """Per-area audio cache folder so multiple areas don't share mp3 files."""
     return base / f"r{radius_km:g}km_lat{lat:.4f}_lon{lon:.4f}"
 
 
-def _cache_path(xc_id: int) -> Path:
-    return BIRDNET_CACHE_DIR / f"XC{xc_id}.json"
-
-
 def _load_cached_detections(xc_id: int, min_confidence: float) -> list[dict] | None:
-    p = _cache_path(xc_id)
+    p = BIRDNET_CACHE_DIR / f"XC{xc_id}.json"
     if not p.exists():
         return None
     try:
         data = json.loads(p.read_text())
     except (OSError, json.JSONDecodeError):
         return None
-    cached = float(data.get("min_confidence", 1.0))
-    if cached > min_confidence:
-        return None  # cached at a stricter threshold than asked for; would miss detections
+    if float(data.get("min_confidence", 1.0)) > min_confidence:
+        return None  # cached stricter than asked; would miss detections
     return [d for d in data.get("detections", []) if float(d.get("confidence", 0.0)) >= min_confidence]
+
 
 
 def _save_cached_detections(xc_id: int, min_confidence: float, detections: list[dict]) -> None:
@@ -324,7 +299,7 @@ def _save_cached_detections(xc_id: int, min_confidence: float, detections: list[
         }
         for d in detections
     ]
-    _cache_path(xc_id).write_text(
+    (BIRDNET_CACHE_DIR / f"XC{xc_id}.json").write_text(
         json.dumps({"min_confidence": min_confidence, "detections": slim})
     )
 
@@ -337,8 +312,6 @@ async def birdnet_area_analysis(
     pool_size: int = POOL_SIZE,
     delete_audio_after_cache: bool = False,
 ) -> dict[str, pd.DataFrame]:
-    """Download area recordings (cached) and BirdNET each. Returns
-    {detections, by_species, hidden}."""
     work = area_df.dropna(subset=["file"]).reset_index(drop=True)
     if max_recordings is not None:
         work = work.head(max_recordings)
@@ -356,7 +329,7 @@ async def birdnet_area_analysis(
     sem = asyncio.Semaphore(pool_size)
     pbar = tqdm(total=len(work), desc="BirdNET analyse")
 
-    async with AsyncXenoCantoClient(api_key=_api_key()) as xc:
+    async with AsyncXenoCantoClient(api_key=os.getenv("XC_API_KEY", "demo")) as xc:
 
         async def _process(row) -> None:
             xc_id = int(row.id)
@@ -442,8 +415,6 @@ def combined_species_table(
     birdnet_detections: pd.DataFrame,
     min_recordings: int = 1,
 ) -> pd.DataFrame:
-    """Per-species evidence: xc_primary, xc_also, birdnet_only (mutually
-    exclusive per recording). Rows kept: total >= min_recordings."""
     xc_primary = (
         area_df.groupby("scientific_name").size().rename("xc_primary")
     )
@@ -499,7 +470,6 @@ def longest_recordings(
     center: tuple[float, float],
     top_n: int = 10,
 ) -> pd.DataFrame:
-    """Top-N longest recordings in the area, with haversine distance (km) to ``center``."""
     df = area_df.dropna(subset=["length_seconds"]).copy()
     lat0, lon0 = center
     df["distance_km"] = [

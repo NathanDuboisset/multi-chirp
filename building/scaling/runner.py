@@ -1,8 +1,3 @@
-"""Scaling-experiment runner: ScalingRunConfig, baseline/scaling result
-schemas, run_experiments, and summary/plot helpers. Shared training
-primitives (dataset builders, prediction/metric helpers, model_factory,
-load_dataset_catalog) live in `building.training`."""
-
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -38,10 +33,13 @@ class ScalingRunConfig(BaseModel):
     models_dir: Path
     results_file: Path
     augment: bool = True
-    # Per scaling sample, fold this many random unchosen target species into
-    # the "other" class, sampled uniformly alongside the existing non_target
-    # bucket. Keeps "other" diversity comparable across k values.
+    # fold this many unchosen target species into the "other" class so its
+    # diversity stays comparable across k values
     extras_into_other: int = 4
+    # ReduceLROnPlateau sits inside EarlyStopping(patience)
+    lr_patience: int = 3
+    lr_factor: float = 0.5
+    lr_min: float = 1e-5
 
 
 class BaseRunResult(BaseModel):
@@ -68,7 +66,7 @@ class BaselineRunResult(BaseRunResult):
     target_class: str
     target_idx: int
     metrics: RunMetrics
-    # New fields — optional so old rows keep parsing.
+    # optional so old rows keep parsing
     label_names: list[str] | None = None
     float_metrics: RunMetrics | None = None
     quant_stats: QuantStats | None = None
@@ -86,7 +84,7 @@ class ScalingResult(BaseRunResult):
     extra_other_indices: list[int] = []
     extra_other_classes: list[str] = []
     metrics: RunMetrics
-    # New fields — optional so old rows keep parsing.
+    # optional so old rows keep parsing
     label_names: list[str] | None = None
     float_metrics: RunMetrics | None = None
     quant_stats: QuantStats | None = None
@@ -152,7 +150,6 @@ def run_experiments(
         extra: dict[str, Any],
         extra_other_idxs: list[int] | None = None,
     ) -> None:
-        # Drop any state lingering from a previous experiment before we start.
         tf.keras.backend.clear_session()
         gc.collect()
         model = history = None
@@ -203,17 +200,23 @@ def run_experiments(
                 epochs=config.epochs,
                 verbose=FIT_VERBOSE,
                 callbacks=[
+                    tf.keras.callbacks.ReduceLROnPlateau(
+                        monitor="val_loss",
+                        factor=config.lr_factor,
+                        patience=config.lr_patience,
+                        min_lr=config.lr_min,
+                        verbose=1,
+                    ),
                     tf.keras.callbacks.EarlyStopping(
                         monitor="val_loss",
                         patience=config.patience,
                         restore_best_weights=True,
-                    )
+                    ),
                 ],
             )
             test_loss = float(model.evaluate(test_ds, verbose=0)[0])  # ty:ignore[not-subscriptable]
 
-            # Label names match build_dataset_from_catalog: chosen classes first,
-            # then "non_target" (which folds non_target + any extra_other_idxs).
+            # chosen classes first, then "non_target" (folds non_target + extra_other_idxs)
             label_names = [catalog.class_names[i] for i in chosen_idxs] + [NON_TARGET_NAME]
 
             model_path = (
@@ -224,7 +227,6 @@ def run_experiments(
             model_path.parent.mkdir(parents=True, exist_ok=True)
             model.save(model_path)
 
-            # Post-training quantization + side-by-side float/INT8 evaluation.
             from building.models import model_eval as M
             from building.models.bake import bake_model
             from building import results_io as R
@@ -242,7 +244,7 @@ def run_experiments(
             y_pred_float = cmp.float_eval.y_score
             y_pred_quant = cmp.quant_eval.y_score
 
-            # Quantized BCE — keep the deployment reality as the canonical "loss".
+            # quantized BCE is the canonical "loss" (deployment reality)
             quant_loss = float(
                 tf.keras.losses.BinaryCrossentropy()(y_true_float, y_pred_quant).numpy()
             )
@@ -305,8 +307,8 @@ def run_experiments(
             existing.append(res)
             produced.append(res)
         finally:
-            # Drop dataset references *before* clear_session so iterator /
-            # shuffle-buffer state isn't pinned across the session teardown.
+            # drop dataset refs before clear_session so iterator/shuffle-buffer
+            # state isn't pinned across session teardown
             del model, history, train_ds, val_ds, test_ds
             tf.keras.backend.clear_session()
             gc.collect()
@@ -381,7 +383,6 @@ def print_baselines(catalog: DatasetCatalog, results_file: Path) -> None:
     baseline_df = df[df["run_type"] == "baseline"].copy()
     class_names = list(catalog.class_names)
 
-    # Calculate the longest class name
     max_cls_len = max((len(str(cls)) for cls in class_names), default=0)
     col_width = max(max_cls_len + 2, 15)
 

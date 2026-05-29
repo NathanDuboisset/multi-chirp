@@ -1,18 +1,3 @@
-"""Single source of truth for the post-PTQ run-result schema.
-
-The on-disk shape is a pydantic ``RunRecord`` (one JSON object per run, written
-as ``.json`` for task notebooks or as a JSONL line for scaling) plus a sibling
-``.npz`` carrying the raw arrays (``y_true``, ``y_score_float``,
-``y_score_quant``, per-class ROC + threshold-sweep slices). The JSON keeps the
-summary metrics + sampled curves for quick inspection; the NPZ keeps the full
-data so any new metric or threshold can be re-derived later without retraining.
-
-Round-trip: ``build_run_record`` → ``write_run_record_json`` → ``load_run``
-returns rebuilt ``EvalResult`` objects whose per-class numbers match what was
-originally written, because the per-class thresholds are persisted with the
-record and reapplied on load.
-"""
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -32,12 +17,7 @@ SWEEP_THRESHOLDS = np.linspace(0.0, 1.0, 101)
 RECORD_SCHEMA_VERSION = 2
 
 
-# JSON-side pydantic models
-
-
 class PerClassBlock(BaseModel):
-    """Per-class metrics at the threshold used by the run."""
-
     support: int
     threshold: float
     precision: float
@@ -60,8 +40,6 @@ class PerClassBlock(BaseModel):
 
 
 class BackendMetrics(BaseModel):
-    """Summary metrics for one backend (float Keras or INT8 TFLite)."""
-
     backend: Literal["keras", "tflite"]
     threshold_mode: str
     loss: float | None = None
@@ -80,10 +58,10 @@ class BackendMetrics(BaseModel):
         macro_targets: MacroBlock | None = None
         if e.non_target_names:
             macro_targets = MacroBlock(
-                precision=_float_or_zero(e.macro_precision_targets),
-                recall=_float_or_zero(e.macro_recall_targets),
-                f1=_float_or_zero(e.macro_f1_targets),
-                f2=_float_or_zero(e.macro_f2_targets),
+                precision=float(e.macro_precision_targets or 0.0),
+                recall=float(e.macro_recall_targets or 0.0),
+                f1=float(e.macro_f1_targets or 0.0),
+                f2=float(e.macro_f2_targets or 0.0),
                 auc=e.macro_auc_targets,
             )
         return cls(
@@ -106,11 +84,6 @@ class BackendMetrics(BaseModel):
         )
 
 
-def _float_or_zero(v: float | None) -> float:
-    """MacroBlock requires non-null floats for precision/recall/f1/f2."""
-    return 0.0 if v is None else float(v)
-
-
 class MacroDelta(BaseModel):
     precision: float | None = None
     recall: float | None = None
@@ -128,8 +101,6 @@ class PerClassDelta(BaseModel):
 
 
 class DeltaBlock(BaseModel):
-    """Quantized − float across every comparable scalar."""
-
     top1_accuracy: float | None = None
     subset_accuracy: float | None = None
     loss: float | None = None
@@ -268,11 +239,8 @@ def _roc_block(e: "EvalResult", *, target_only: bool) -> dict[str, ROCCurve]:
 
 
 def _prediction_rates(e: "EvalResult") -> list[list[float]]:
-    """Row-stochastic prediction-firing matrix at each class's saved threshold.
-
-    Diagonal = recall; off-diagonal cells can sum past 1 (predictions are
-    independent multi-label sigmoids).
-    """
+    # Diagonal = recall; off-diagonal cells can sum past 1 (predictions are
+    # independent multi-label sigmoids).
     n = len(e.label_names)
     y_true_bin = (e.y_true >= 0.5).astype(np.int32)
     thresholds = np.array(
@@ -287,19 +255,7 @@ def _prediction_rates(e: "EvalResult") -> list[list[float]]:
     return rates.tolist()
 
 
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 class RunRecord(BaseModel):
-    """Canonical v2 JSON record. ``extra='allow'`` lets pipelines attach
-    pipeline-specific fields (hyperparams, model paths, cascade stage stats,
-    extra arrays, ...) without each one needing its own subclass.
-
-    Construct via ``RunRecord.from_comparison(cmp, ...)``; persist via
-    ``record.save(json_path)`` (writes JSON + sibling ``.npz``).
-    """
-
     model_config = ConfigDict(extra="allow")
 
     schema_version: Literal[2] = 2
@@ -312,9 +268,9 @@ class RunRecord(BaseModel):
     curves_quantized: CurvesBlock
     roc_quantized: dict[str, ROCCurve] = Field(default_factory=dict)
     prediction_rates_quantized: list[list[float]] | None = None
-    timestamp: str = Field(default_factory=_utc_now)
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
-    # Transient — never serialized. Set by from_comparison so save() can flush
+    # Transient, never serialized. Set by from_comparison so save() can flush
     # the raw arrays without the caller having to thread them through again.
     _cmp: "QuantComparison | None" = PrivateAttr(default=None)
     _extra_arrays: dict[str, np.ndarray] = PrivateAttr(default_factory=dict)
@@ -330,15 +286,6 @@ class RunRecord(BaseModel):
         extra_arrays: dict[str, np.ndarray] | None = None,
         **meta: Any,
     ) -> "RunRecord":
-        """Build a record straight from a `QuantComparison`.
-
-        `meta` is splatted into the model as ``extra='allow'`` fields — pass
-        the run-specific knobs (``collection``, ``run_name``, ``build_model``,
-        ``hyperparams``, ``model_path``, ``tflite_path``, ...) directly.
-        `losses=(float_bce, quant_bce)` populates the per-backend loss.
-        `extra_arrays` are merged into the NPZ sidecar on `.save()` so cascade
-        runs can stash stage-1/stage-2 raw scores without a separate write.
-        """
         nt = list(non_target_names)
         float_loss, quant_loss = losses
         float_block = BackendMetrics.from_eval(cmp.float_eval, loss=float_loss)
@@ -368,18 +315,13 @@ class RunRecord(BaseModel):
         with_arrays: bool = True,
         npz_file: Path | str | None = None,
     ) -> Path:
-        """Write the JSON record (and, by default, a sibling `.npz` sidecar).
-
-        `with_arrays=False` skips the npz — useful when the source comparison
-        wasn't attached (e.g. records reconstituted from disk).
-        """
         results_path = Path(results_file)
         results_path.parent.mkdir(parents=True, exist_ok=True)
         results_path.write_text(self.model_dump_json(indent=2, by_alias=True))
         if with_arrays:
             if self._cmp is None:
                 raise ValueError(
-                    "Cannot write arrays — record was not built from a QuantComparison."
+                    "Cannot write arrays, record was not built from a QuantComparison."
                 )
             npz_path = (
                 Path(npz_file)
@@ -401,8 +343,6 @@ class RunRecord(BaseModel):
         npz_dir: Path | str | None = None,
         npz_key: str | None = None,
     ) -> Path:
-        """Append the record as a JSONL line. `npz_dir`/`npz_key` write the
-        sidecar to ``<npz_dir>/<npz_key>.npz`` when arrays are attached."""
         results_path = Path(results_file)
         results_path.parent.mkdir(parents=True, exist_ok=True)
         with results_path.open("a", encoding="utf-8") as f:
@@ -418,16 +358,12 @@ class RunRecord(BaseModel):
         return results_path
 
 
-# Public API
-
-
 def build_arrays_npz(
     *,
     float_eval: "EvalResult",
     quant_eval: "EvalResult",
     target_only: bool = False,
 ) -> dict[str, np.ndarray]:
-    """Pack y_true / y_score / per-class ROC + sweep arrays for an NPZ sidecar."""
     from building.models.model_eval import roc_arrays, threshold_curve
 
     out: dict[str, np.ndarray] = {
@@ -464,8 +400,6 @@ def build_arrays_npz(
 
 
 class LoadedRun(BaseModel):
-    """Container holding the round-tripped pieces of one run."""
-
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     record: RunRecord
@@ -478,7 +412,6 @@ class LoadedRun(BaseModel):
 
     @property
     def meta(self) -> dict[str, Any]:
-        """Round-tripped JSON as a plain dict (for legacy callers)."""
         return self.record.model_dump(mode="json", by_alias=True)
 
 
@@ -519,14 +452,6 @@ def load_run(
     *,
     npz_path: Path | str | None = None,
 ) -> LoadedRun:
-    """Round-trip a saved run back into EvalResults so a results notebook
-    can re-render every display without rerunning the model.
-
-    Only the v2 schema is supported. Legacy json files (pre-PTQ schema)
-    don't ship the raw arrays; open them with
-    ``building.geographic_task.results_grouped.gather_results`` for
-    cross-run comparison instead.
-    """
     from building.models.bake import TFLiteStats
     from building.models.model_eval import QuantComparison
 
@@ -547,8 +472,6 @@ def load_run(
 
     tflite_stats: TFLiteStats | None = None
     if record.tflite_stats is not None:
-        # TFLiteStatsBlock and TFLiteStats share the same field set; round-trip
-        # via the JSON-shaped dump so the validator handles the Path/tuple casts.
         tflite_stats = TFLiteStats.model_validate(
             record.tflite_stats.model_dump(mode="python")
         )

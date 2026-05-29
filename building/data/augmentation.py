@@ -1,5 +1,3 @@
-"""Audio augmentations for bird-call training, built on `audiomentations`."""
-
 from __future__ import annotations
 
 import numpy as np
@@ -48,12 +46,6 @@ MP3_BITRATE = (64, 160)
 CLIPPING_PERCENTILE = (0, 5)
 
 
-def _has_wavs(path: Path) -> bool:
-    if not path.exists():
-        return False
-    return next(path.rglob("*.wav"), None) is not None
-
-
 noise_choices: list = [
     AddGaussianNoise(
         min_amplitude=GAUSSIAN_NOISE_AMPLITUDE[0],
@@ -61,7 +53,7 @@ noise_choices: list = [
         p=1.0,
     ),
 ]
-if _has_wavs(AUDIOSET_DIR):
+if AUDIOSET_DIR.exists() and next(AUDIOSET_DIR.rglob("*.wav"), None) is not None:
     noise_choices.append(
         AddBackgroundNoise(
             sounds_path=str(AUDIOSET_DIR),
@@ -122,7 +114,6 @@ def augment(audio: np.ndarray) -> np.ndarray:
 
 
 def augment_tf(audio):
-    """tf.data-compatible wrapper: same augment pipeline, applied per sample."""
     import tensorflow as tf
 
     def _np_augment(arr: np.ndarray) -> np.ndarray:

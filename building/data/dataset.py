@@ -1,5 +1,3 @@
-"""Symlink target + non_target clips into a train/val/test collection."""
-
 from __future__ import annotations
 
 import random
@@ -19,9 +17,6 @@ RAW_DATASET_DIR = ROOT / "raw_dataset"
 SUBSAMPLES_DIR = RAW_DATASET_DIR / "subsamples"
 AUDIOSET_DIR = RAW_DATASET_DIR / "audioset"
 NON_TARGET_OTHER_DIR = SUBSAMPLES_DIR / "non_target_other"
-# Clips passed to BirdNET with no bird detected — kept on-disk under
-# non_target_empty/ for historical reasons; semantically these are
-# "birdnet-no-bird" clips, used as a quiet/ambient negative source.
 BIRDNET_NO_BIRD_DIR = SUBSAMPLES_DIR / "non_target_empty"
 DATASETS_DIR = ROOT / "datasets"
 
@@ -79,16 +74,6 @@ def balanced_non_target(
     other_species_folders: list[Path],
     per_species_cap: int | None = None,
 ) -> list[Path]:
-    """Build the non_target pool: 50/50 audioset + xc_other, plus all
-    birdnet-no-bird on top. The audioset and xc_other buckets are each
-    capped at the size of the smaller of the two so they contribute equally;
-    birdnet-no-bird is taken in full since it's a small, distinct source.
-
-    ``per_species_cap`` (optional) caps each other-species folder's
-    contribution to the xc_other pool *before* pooling, so a single
-    species with disproportionately many on-disk clips (e.g. because it
-    was downloaded as a target in another collection) can't dominate.
-    """
     audioset_pool = audioset_round_robin()
     other_pool: list[Path] = []
     for folder in other_species_folders:
@@ -103,19 +88,12 @@ def balanced_non_target(
     )
 
     n_each = min(len(audioset_pool), len(other_pool))
-    out: list[Path] = []
-    out.extend(audioset_pool[:n_each])
-    out.extend(other_pool[:n_each])
-    out.extend(no_bird_pool)
-    cap_note = f" (per-species cap={per_species_cap})" if per_species_cap is not None else ""
+    out = audioset_pool[:n_each] + other_pool[:n_each] + no_bird_pool
+    cap_note = f" cap={per_species_cap}" if per_species_cap is not None else ""
     print(
-        f"Non-target pool: {len(out)} clips "
-        f"({n_each} audioset + {n_each} xc_other + {len(no_bird_pool)} birdnet_no_bird)"
-        f"{cap_note}"
+        f"non_target: {len(out)} = {n_each}/{len(audioset_pool)} audioset "
+        f"+ {n_each}/{len(other_pool)} xc_other + {len(no_bird_pool)} no_bird{cap_note}"
     )
-    print(f"  audioset:         take {n_each} of {len(audioset_pool)} available")
-    print(f"  xc_other:         take {n_each} of {len(other_pool)} available")
-    print(f"  birdnet_no_bird:  take {len(no_bird_pool)} of {len(no_bird_pool)} available")
     return out
 
 
@@ -167,22 +145,20 @@ def build_task_dataset(
 
     rng = random.Random(SPLIT_SEED)
     for folder, all_clips in class_to_clips.items():
-        print(f"Processing {folder} with {len(all_clips)} clips")
         buckets = split_class(all_clips, rng)
         print(
-            f"Training: {len(buckets['training'])}, "
-            f"Validation: {len(buckets['validation'])}, "
-            f"Testing: {len(buckets['testing'])}"
+            f"{folder}: total={len(all_clips)} "
+            f"train={len(buckets['training'])} "
+            f"val={len(buckets['validation'])} "
+            f"test={len(buckets['testing'])}"
         )
         for split_name in SPLIT_NAMES:
-            files = buckets[split_name]
             dest = dataset_root / split_name / folder
             dest.mkdir(parents=True, exist_ok=True)
-            for i, file_path in enumerate(files):
+            for i, file_path in enumerate(buckets[split_name]):
                 target = dest / f"{split_name}_{i}.wav"
                 if not target.exists():
                     target.symlink_to(file_path.resolve())
-            print(f"Copied {len(files)} clips from {folder} to {split_name}")
 
     return dataset_root
 
@@ -192,16 +168,6 @@ def build_cascading_dataset(
     target_species: list[str],
     non_target_species: list[str],
 ) -> Path:
-    """Variant of `build_task_dataset` that keeps "bird" and "no-bird"
-    negatives in separate folders so a cascading pipeline can train a
-    binary bird detector and a bird-only classifier from the same
-    on-disk collection.
-
-    Produced layout under ``datasets/<collection_name>/<split>/``:
-      ``<target_species_i>``  — one folder per target species (as-is)
-      ``non_target_bird``     — other-bird species pooled (XC/eBird only)
-      ``no_bird``             — AudioSet ambient + BirdNET no-bird pooled
-    """
     dataset_root = DATASETS_DIR / collection_name
     for s in SPLIT_NAMES:
         (dataset_root / s).mkdir(parents=True, exist_ok=True)
@@ -228,30 +194,24 @@ def build_cascading_dataset(
     if no_bird:
         class_to_clips["no_bird"] = no_bird
 
-    print(
-        f"Cascading pools: non_target_bird={len(non_target_bird)} "
-        f"no_bird={len(no_bird)} "
-        f"(audioset_round_robin + birdnet_no_bird)"
-    )
+    print(f"cascading pools: non_target_bird={len(non_target_bird)} no_bird={len(no_bird)}")
 
     rng = random.Random(SPLIT_SEED)
     for folder, all_clips in class_to_clips.items():
-        print(f"Processing {folder} with {len(all_clips)} clips")
         buckets = split_class(all_clips, rng)
         print(
-            f"Training: {len(buckets['training'])}, "
-            f"Validation: {len(buckets['validation'])}, "
-            f"Testing: {len(buckets['testing'])}"
+            f"{folder}: total={len(all_clips)} "
+            f"train={len(buckets['training'])} "
+            f"val={len(buckets['validation'])} "
+            f"test={len(buckets['testing'])}"
         )
         for split_name in SPLIT_NAMES:
-            files = buckets[split_name]
             dest = dataset_root / split_name / folder
             dest.mkdir(parents=True, exist_ok=True)
-            for i, file_path in enumerate(files):
+            for i, file_path in enumerate(buckets[split_name]):
                 target = dest / f"{split_name}_{i}.wav"
                 if not target.exists():
                     target.symlink_to(file_path.resolve())
-            print(f"Copied {len(files)} clips from {folder} to {split_name}")
 
     return dataset_root
 
@@ -285,21 +245,19 @@ def build_dataset(
 
     rng = random.Random(SPLIT_SEED)
     for folder, all_clips in class_to_clips.items():
-        print(f"Processing {folder} with {len(all_clips)} clips")
         buckets = split_class(all_clips, rng)
         print(
-            f"Training: {len(buckets['training'])}, "
-            f"Validation: {len(buckets['validation'])}, "
-            f"Testing: {len(buckets['testing'])}"
+            f"{folder}: total={len(all_clips)} "
+            f"train={len(buckets['training'])} "
+            f"val={len(buckets['validation'])} "
+            f"test={len(buckets['testing'])}"
         )
         for split_name in SPLIT_NAMES:
-            files = buckets[split_name]
             dest = dataset_root / split_name / folder
             dest.mkdir(parents=True, exist_ok=True)
-            for i, file_path in enumerate(files):
+            for i, file_path in enumerate(buckets[split_name]):
                 target = dest / f"{split_name}_{i}.wav"
                 if not target.exists():
                     target.symlink_to(file_path.resolve())
-            print(f"Copied {len(files)} clips from {folder} to {split_name}")
 
     return dataset_root

@@ -1,17 +1,11 @@
-"""Real-world per-minute eval on long XC recordings.
-
-- pick top-N longest in area, download + cache MP3 / meta / BirdNET jsonl
-- stream INT8 tflite over 3 s windows, aggregate per minute
-- join with BirdNET to get P(bird|model), P(correct|species), P(miss|birdnet)
-"""
-
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -19,7 +13,7 @@ import pyrootutils
 from tqdm.auto import tqdm
 from xenocanto3 import AsyncXenoCantoClient, Recording
 
-from building.analysis import _api_key, _run_birdnet
+from building.analysis import _run_birdnet
 from building.data.download import POOL_SIZE
 
 ROOT = pyrootutils.setup_root(
@@ -65,13 +59,14 @@ async def download_long(
     sem = asyncio.Semaphore(pool_size)
     pbar = tqdm(total=len(picks), desc="download long XC")
 
-    async with AsyncXenoCantoClient(api_key=_api_key()) as xc:
+    async with AsyncXenoCantoClient(api_key=os.getenv("XC_API_KEY", "demo")) as xc:
 
         async def _fetch(row) -> None:
             xc_id = int(row.id)
             audio_path = out_dir / f"XC{xc_id}.mp3"
             meta_path = out_dir / f"XC{xc_id}.meta.json"
             if not audio_path.exists():
+
                 async with dl_lock:
                     now = asyncio.get_event_loop().time()
                     wait = XC_DL_INTERVAL - (now - dl_last[0])
@@ -142,7 +137,6 @@ def birdnet_long(
     files = sorted(audio_dir.glob("XC*.mp3"))
     for f in tqdm(files, desc="BirdNET long"):
         jsonl_path = f.with_suffix(".birdnet.jsonl")
-        # skip if cached at a looser-or-equal threshold for the same target set
         if jsonl_path.exists() and not overwrite:
             try:
                 header = json.loads(jsonl_path.read_text().splitlines()[0])
@@ -283,13 +277,25 @@ def predict_recording(
 def model_per_minute(
     win_df: pd.DataFrame,
     target_labels: Sequence[str],
-    threshold: float,
+    threshold: float | Mapping[str, float],
 ) -> pd.DataFrame:
     g = win_df.groupby("minute")[list(target_labels)].mean()
+    if isinstance(threshold, Mapping):
+        thr_vec = np.array([float(threshold[n]) for n in target_labels])
+    else:
+        thr_vec = np.full(len(target_labels), float(threshold))
+    probs = g.to_numpy()
+    passes = probs >= thr_vec[None, :]
+    masked = np.where(passes, probs, -np.inf)
+    best_idx = masked.argmax(axis=1)
+    any_pass = passes.any(axis=1)
+    species = np.array(list(target_labels))[best_idx]
     out = pd.DataFrame(index=g.index.copy())
-    out["max_target_prob"] = g.max(axis=1)
-    out["predicted_species"] = g.idxmax(axis=1).where(out["max_target_prob"] >= threshold)
-    out["bird"] = out["predicted_species"].notna()
+    out["max_target_prob"] = probs.max(axis=1)
+    out["predicted_species"] = pd.Series(
+        np.where(any_pass, species, None), index=g.index
+    )
+    out["bird"] = any_pass
     return out.reset_index()
 
 
@@ -380,7 +386,7 @@ def evaluate_long_recordings(
     tflite_path: Path,
     label_names: Sequence[str],
     target_species: Sequence[str],
-    threshold: float = 0.5,
+    threshold: float | Mapping[str, float] = 0.5,
 ) -> tuple[list[RecordingReport], MinuteStats]:
     runner = TFLiteRunner.load(tflite_path)
     target_labels = [n for n in label_names if n in {s.replace(" ", "_") for s in target_species}]

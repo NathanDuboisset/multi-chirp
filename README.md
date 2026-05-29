@@ -1,81 +1,42 @@
 ## TinyChirp on MicroFlow
 
-Trying to expand tinychirp to more bird species
-Using microflow and ariel os as the infrastructure, for a full Rust code
+Expanding [TinyChirp](https://github.com/TinyPART/TinyChirp) ([paper](https://arxiv.org/abs/2407.21453)) to more bird species, deployed in Rust via [MicroFlow](https://github.com/matteocarnelos/microflow-rs) ([paper](https://arxiv.org/pdf/2409.19432)) on Ariel OS.
 
-- MicroFlow repo: `https://github.com/matteocarnelos/microflow-rs`
-- MicroFlow paper: `https://arxiv.org/pdf/2409.19432`
+## Layout
 
-Based of the following :
+- `building/`: Python (datasets, training, PTQ, eval)
+- `src/`, `Cargo.toml`, `laze-project.yml`: Rust firmware
+- `datasets/<collection>/{training,validation,testing}/<Class>/`
+- `models/<collection>/<model>.{keras,tflite}`
+- `results/<collection>/<model>.{json,npz}`
 
-- TinyChirp repo: `https://github.com/TinyPART/TinyChirp`
-- TinyChirp paper: `https://arxiv.org/abs/2407.21453`
+## Setup
 
-## How to build models
+- `cd building && uv sync` ([uv](https://docs.astral.sh/uv/))
+- `building/.env`:
+  - `XC_API_KEY=...` ([xeno-canto](https://xeno-canto.org/account/api))
+  - `EBIRD_API_KEY=...` ([ebird](https://ebird.org/api/keygen), required)
 
-uv from astral (https://docs.astral.sh/uv/) is used to manage python deps. Since torch and tensorflow can be conflicting on versions, there is two folders to generate, each having its own env,
-In a folder, run 
-```
-uv sync
-```
-then run notebooks with the .venv created in that folder
+## Pipelines
 
-### How to run
+Each pipeline is driven by its own notebooks; instructions live there.
 
-From the repo root:
+- `building/scaling/`: taxonomic scaling sweep (k = 2..N)
+- `building/geographic_task/`: place + target species, multi-label model, scored on long recordings
+- `building/geographic_scale/`: scaling sweep rooted in a place
 
-```bash
-laze build -b {your-board-ariel-id} run
-```
-This builds the firmware, runs the TinyChirp model on test clips and prints predictions + latency over serial.
+Models: `cnn1d`, `sincnet`, `leaf`, `transformer`, `squeezenet_time`, `mel_cnn`, `mel_cnn_2`, `squeezenet_mel` (see `building.models.available_models()`).
 
-### Check RAM / Flash usage
-
-Binary path after build:
-
-```text
-build/bin/{your-board-ariel-id}/cargo/thumbv8m.main-none-eabihf/release/tiny-chrip-microflow
-```
-
-Example:
+## Deploy
 
 ```bash
-runtime_file_path=build/bin/{your-board-ariel-id}/cargo/thumbv8m.main-none-eabihf/release/tiny-chrip-microflow
-
-arm-none-eabi-size "$runtime_file_path"
-nm --print-size --size-sort --demangle=rust --radix=d "$runtime_file_path"
+laze build -b {board-id} run
 ```
 
-## Dataset pipeline (`building/`)
-
-Multi-class bird sound datasets built from [Xeno-canto](https://xeno-canto.org/).
-
-### Setup
+Binary size:
 
 ```bash
-cd building
-uv sync
-echo "XC_API_KEY=your_key_here" > ../.env
+runtime=build/bin/{board-id}/cargo/thumbv8m.main-none-eabihf/release/tiny-chrip-microflow
+arm-none-eabi-size "$runtime"
+nm --print-size --size-sort --demangle=rust --radix=d "$runtime"
 ```
-
-### Steps
-
-1. **Select species** — `taxonomy.py` downloads the eBird taxonomy and queries XC for recording counts. Species with <100 recordings are excluded. Four collections are assembled:
-   - `diff_species` — N species from different genera
-   - `diff_genus` — N species, same genus
-   - `diff_family` — N species, different genera, same family
-   - `diff_order` — N species, different families, same order
-
-2. **Download** — `download.py` fetches MP3s from XC API v3 at original sample rate into `raw_dataset/<Genus_species>/`.
-
-3. **Validate & split** — `dataset.py` runs BirdNET (threshold 0.92) on each recording, extracts confirmed 3 s clips at **16 kHz**, and assembles:
-   ```
-   datasets/<collection>/
-       training/<Species>/
-       validation/<Species>/
-       testing/<Species>/
-   ```
-
-4. **Train** — `scaling.ipynb` drives baseline + scaling experiments. Pick any model from `building.models.available_models()` (`cnn1d`, `sincnet`, `leaf`, `mel_cnn`); the input representation (raw waveform vs log-mel) is inferred from the registry in `building/models/__init__.py`. Each model file exposes a `build(n_classes, …) -> keras.Model` returning a compiled sigmoid head.
-
-5. **Evaluate** — `scaling.run_experiments()` writes per-run metrics to `results.jsonl`; `summarize_results()` + `plot_summary()` produce the macro precision/recall/F1/top-1 curves over k.

@@ -22,12 +22,9 @@ ROOT = pyrootutils.setup_root(
 )
 
 FIT_VERBOSE = 2
-# Per-class shuffle buffer cap. Each unit ≈ 48000 × 4 B = 187 KB of resident
-# RAM, held for the duration of the epoch. At k=10 classes the total is
-# SHUFFLE_BUFFER_CAP × 10 × 192 KB. Keep small; the file-level shuffle in
-# dataset.py already provides bulk randomness.
-SHUFFLE_BUFFER_CAP = 256
+SHUFFLE_BUFFER_CAP = 256  # per-class; file-level shuffle in dataset.py handles bulk randomness
 PREFETCH_BUFFER = 2
+
 
 def configure_tf_for_long_runs() -> None:
     try:
@@ -46,8 +43,6 @@ configure_tf_for_long_runs()
 
 @dataclass
 class ClassSplit:
-    """Per-class, per-split cached unbatched dataset (features only, no label)."""
-
     ds: tf.data.Dataset
     count: int
 
@@ -61,16 +56,12 @@ class ClassEntry:
     test: ClassSplit
 
 class DatasetCatalog(BaseModel):
-    """Replaces DatasetArrays: holds per-class cached TF datasets instead of numpy blobs."""
-
     model_config = ConfigDict(arbitrary_types_allowed=True)
     class_names: list[str]
     entries: list[ClassEntry]  # parallel to class_names
 
 
 class PerClassMetricsLite(BaseModel):
-    """Per-class metrics at a fixed threshold, persisted in run results."""
-
     support: int
     accuracy: float
     precision: float
@@ -81,8 +72,6 @@ class PerClassMetricsLite(BaseModel):
 
 
 class MacroBlock(BaseModel):
-    """Mean-over-classes summary at the chosen threshold."""
-
     precision: float
     recall: float
     f1: float
@@ -99,7 +88,7 @@ class RunMetrics(BaseModel):
     f1_std: float
     top1_accuracy: float
     loss: float
-    # New fields — optional for backwards-compat with old jsonl rows.
+    # optional for backwards-compat with old jsonl rows
     per_class: dict[str, PerClassMetricsLite] | None = None
     macro_targets: MacroBlock | None = None
     macro_all: MacroBlock | None = None
@@ -117,10 +106,7 @@ _CACHE_BATCH = 1  # one file per batch so a corrupt clip only drops itself
 
 
 def _feature_config_hash() -> str:
-    """Hash the waveform-cache config (sample rate + target length).
-
-    The cache stores raw waveform now; mel STFT runs at training time, so
-    changing mel parameters does NOT invalidate the cache."""
+    # mel STFT runs at train time so mel params don't invalidate the cache
     from building.utils import SAMPLE_RATE, TARGET_AUDIO_LEN_MEL
 
     cfg: dict[str, Any] = {
@@ -132,13 +118,6 @@ def _feature_config_hash() -> str:
 
 
 def cleanup_waveform_cache(collection: str) -> None:
-    """Wipe the waveform cache for a collection.
-
-    Useful at the end of training to reclaim disk space and to guarantee the
-    next run rebuilds from the current files on disk (the cache key is keyed
-    only on the feature config, not the file-set, so it doesn't auto-invalidate
-    when the dataset folder is edited).
-    """
     import shutil
 
     cache_root = ROOT / ".cache" / collection
@@ -151,7 +130,6 @@ def cleanup_waveform_cache(collection: str) -> None:
 
 
 def load_dataset_catalog(collection: str) -> DatasetCatalog:
-    """Per-class cached waveform DatasetCatalog. Cache invalidates via cfg hash."""
     from building.utils import SAMPLE_RATE, fix_audio_length_mel
 
     keras = tf.keras
@@ -173,11 +151,10 @@ def load_dataset_catalog(collection: str) -> DatasetCatalog:
         count_file = cache_dir / "count.json"
         cache_index = Path(cache_path + ".index")
 
-        # Remove stale lockfiles left by interrupted previous runs.
         for lockfile in cache_dir.glob("*.lockfile"):
             lockfile.unlink(missing_ok=True)
 
-        # Load only this class's audio files; label (always 0) is discarded.
+        # label (always 0) is discarded; we only need this class's waveforms
         ds_raw = keras.utils.audio_dataset_from_directory(
             split_dir,
             labels="inferred",
@@ -189,9 +166,7 @@ def load_dataset_catalog(collection: str) -> DatasetCatalog:
         )
         ds: tf.data.Dataset = (
             ds_raw
-            # AudioSet downloads occasionally contain corrupt headers; skip
-            # them rather than aborting the whole class. log_warning prints
-            # the offending file path so it can be removed at leisure.
+            # AudioSet occasionally has corrupt headers; skip rather than abort
             .apply(tf.data.experimental.ignore_errors(log_warning=True))
             .map(
                 tf.autograph.experimental.do_not_convert(lambda x, _: _feature_fn(x)),
@@ -203,7 +178,6 @@ def load_dataset_catalog(collection: str) -> DatasetCatalog:
 
         cache_complete = count_file.exists() and cache_index.exists()
         if not cache_complete:
-            # Wipe any partial cache shards so TF starts from a clean slate.
             for stale in cache_dir.glob("data*"):
                 stale.unlink(missing_ok=True)
             count_file.unlink(missing_ok=True)
@@ -216,9 +190,7 @@ def load_dataset_catalog(collection: str) -> DatasetCatalog:
             count_file.write_text(json.dumps({"count": count}))
             print(f"{count} samples")
 
-        # ignore_errors() makes cardinality UNKNOWN, which then propagates
-        # all the way to Keras and triggers spurious "ran out of data"
-        # warnings. We know the real count from the cache, so assert it.
+        # ignore_errors() makes cardinality UNKNOWN; reassert to silence Keras
         ds = ds.apply(tf.data.experimental.assert_cardinality(count))
         return ClassSplit(ds=ds, count=count)
 
@@ -254,21 +226,6 @@ def build_dataset_from_catalog(
     augment: bool = False,
     extra_other_idxs: list[int] | None = None,
 ) -> tuple[tf.data.Dataset, DatasetMeta]:
-    """Build a batched TF dataset for one experiment from the on-disk catalog.
-
-    Train: every class's per-class waveform dataset is concatenated under the
-    natural distribution and globally shuffled. One epoch = one pass over every
-    training sample. Per-class inverse-frequency weights (mean-normalised to 1)
-    are emitted as the ``sample_weight`` element of each ``(x, y, sw)`` batch
-    tuple so Keras reweights the loss without further plumbing.
-    Val/Test: full concatenation, no resampling, no sample weights — eval loss
-    reflects the natural distribution.
-
-    The "other" class is the union of ``non_target_idx`` and any
-    ``extra_other_idxs`` (unchosen target species folded in); sub-buckets are
-    concatenated under the same label.
-    No numpy arrays are allocated; RAM usage is O(batch_size × sample_size).
-    """
     extras = list(extra_other_idxs or [])
     other_idxs = [non_target_idx] + extras
 
@@ -297,7 +254,7 @@ def build_dataset_from_catalog(
     other_label = len(chosen_idxs)
     do_shuffle = split == "train"
 
-    # AutoGraph breaks on reloaded notebook closures; wrap every map fn.
+    # AutoGraph breaks on reloaded notebook closures
     nag = tf.autograph.experimental.do_not_convert
 
     counts_by_label: dict[int, int] = {}
@@ -321,8 +278,8 @@ def build_dataset_from_catalog(
     total_samples = sum(counts_by_label.values())
 
     if do_shuffle:
-        # Per-class shuffle + numpy-shuffled label schedule via choose_from_datasets:
-        # each sample is visited exactly once per epoch at natural class proportions.
+        # choose_from_datasets with a numpy-shuffled label schedule visits each
+        # sample exactly once per epoch at natural class proportions
         per_class_streams: list[tf.data.Dataset] = []
         for lbl_idx, ds_lbl in enumerate(raw_per_class):
             count = counts_by_label[lbl_idx]
@@ -344,8 +301,7 @@ def build_dataset_from_catalog(
         combined = tf.data.Dataset.choose_from_datasets(
             per_class_streams, schedule_ds
         )
-        # choose_from_datasets reports UNKNOWN cardinality; reassert to silence
-        # Keras' spurious "ran out of data" warning on the final partial batch.
+        # reassert cardinality to silence Keras' "ran out of data" warning
         combined = combined.apply(
             tf.data.experimental.assert_cardinality(int(total_samples))
         )
@@ -354,7 +310,7 @@ def build_dataset_from_catalog(
         for p in raw_per_class[1:]:
             combined = combined.concatenate(p)
 
-    # Inverse-frequency weights w_c = N / (K * n_c), rescaled to mean=1.
+    # inverse-frequency weights w_c = N / (K * n_c), rescaled to mean=1
     raw_weights = {
         lbl: total_samples / (n_classes * count)
         for lbl, count in counts_by_label.items()
@@ -362,8 +318,8 @@ def build_dataset_from_catalog(
     mean_w = sum(raw_weights.values()) / len(raw_weights)
     class_weights = {lbl: w / mean_w for lbl, w in raw_weights.items()}
 
-    # Waveform augmentation runs before _featurize so polarity/shift/noise
-    # also affect the downstream mel STFT.
+    # augmentation runs before _featurize so polarity/shift/noise also affect
+    # the downstream mel STFT
     if do_shuffle and augment:
         from building.data.augmentation import augment_tf
 
@@ -398,8 +354,8 @@ def build_dataset_from_catalog(
         def _featurize(xb: tf.Tensor) -> tf.Tensor:
             return tf.expand_dims(xb, -1)
 
-    # train + val emit sample_weight (Keras → class-balanced val_loss for
-    # EarlyStopping); test stays a 2-tuple for honest natural-distribution loss.
+    # train + val emit sample_weight so EarlyStopping sees class-balanced
+    # val_loss; test stays a 2-tuple for natural-distribution loss
     weighted = split in ("train", "val")
     if weighted:
         @nag
@@ -433,17 +389,6 @@ def build_grouped_dataset_from_catalog(
     input_repr: Literal["time", "mel"] = "time",
     augment: bool = False,
 ) -> tuple[tf.data.Dataset, DatasetMeta]:
-    """Like `build_dataset_from_catalog` but with explicit label groups.
-
-    Each group is a list of catalog class indices; all classes in group i
-    receive label i. Within a group, per-class TF datasets are concatenated;
-    across groups, the train split is mixed via ``sample_from_datasets`` in
-    natural-distribution proportions (same scheme as the existing builder).
-
-    Used by the cascading pipeline: stage 1 pools every bird folder under one
-    label and uses ``no_bird`` as the other; stage 2 reuses the same catalog
-    with one group per target species and a single ``non_target_bird`` group.
-    """
     if not label_groups or any(len(g) == 0 for g in label_groups):
         raise ValueError("label_groups must be a non-empty list of non-empty groups")
 
@@ -585,13 +530,8 @@ def compute_metrics(
     class_names: list[str] | None = None,
     non_target_names: Iterable[str] = (),
 ) -> RunMetrics:
-    """Aggregate run-level metrics from raw predictions.
-
-    When `class_names` is given, fills per-class detail and target-only macros
-    in the returned `RunMetrics`. Legacy fields (recall_mean / std / ...) keep
-    their original semantics (averaged over *every* class) so old jsonl
-    consumers continue to work.
-    """
+    # legacy recall_mean / std / ... fields keep averaging over *every* class
+    # so old jsonl consumers continue to work
     from sklearn.metrics import roc_auc_score
 
     n_classes = y_true.shape[1]
